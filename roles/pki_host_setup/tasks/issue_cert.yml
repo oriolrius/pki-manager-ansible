@@ -1,0 +1,172 @@
+---
+# Issue and install a single certificate
+
+- name: Set certificate defaults
+  ansible.builtin.set_fact:
+    _cert_name: "{{ cert_config.name | default(ansible_hostname) }}"
+    _cert_cn: "{{ cert_config.cn | default(ansible_fqdn | default(ansible_hostname)) }}"
+    _cert_type: "{{ cert_config.type | default('server') }}"
+    _cert_dns_names: "{{ cert_config.dns_names | default([ansible_fqdn | default(ansible_hostname), ansible_hostname] | unique) }}"
+    _cert_ip_addresses: "{{ cert_config.ip_addresses | default([ansible_default_ipv4.address] | select('defined') | list) }}"
+    _cert_validity: "{{ cert_config.validity | default(pki_cert_validity) }}"
+    _cert_format: "{{ cert_config.format | default('pem') }}"
+    _cert_password: "{{ cert_config.password | default(omit) }}"
+    _cert_owner: "{{ cert_config.owner | default('root') }}"
+    _cert_group: "{{ cert_config.group | default('root') }}"
+    _cert_key_group: "{{ cert_config.key_group | default('ssl-cert') }}"
+    _cert_notify: "{{ cert_config.notify | default([]) }}"
+
+- name: Set certificate filenames
+  ansible.builtin.set_fact:
+    _cert_filename: "{{ cert_config.cert_filename | default(_cert_name + '.crt') }}"
+    _cert_key_filename: "{{ cert_config.key_filename | default(_cert_name + '.key') }}"
+    _cert_chain_filename: "{{ cert_config.chain_filename | default(_cert_name + '-chain.crt') }}"
+    _cert_fullchain_filename: "{{ cert_config.fullchain_filename | default(_cert_name + '-fullchain.crt') }}"
+    _cert_p12_filename: "{{ cert_config.p12_filename | default(_cert_name + '.p12') }}"
+
+- name: "Issue certificate: {{ _cert_name }}"
+  oriolrius.pki_manager.pki_manager:
+    action: cert_issue
+    api_url: "{{ pki_api_url }}"
+    oidc_url: "{{ pki_oidc_url }}"
+    client_id: "{{ pki_client_id }}"
+    client_secret: "{{ pki_client_secret }}"
+    validate_certs: "{{ pki_validate_certs }}"
+    ca_id: "{{ pki_ca_id }}"
+    cert_cn: "{{ _cert_cn }}"
+    cert_type: "{{ _cert_type }}"
+    cert_dns_names: "{{ _cert_dns_names }}"
+    cert_ip_addresses: "{{ _cert_ip_addresses }}"
+    cert_validity: "{{ _cert_validity }}"
+    cert_algorithm: "{{ cert_config.algorithm | default(pki_cert_algorithm) }}"
+    cert_org: "{{ cert_config.org | default(omit) }}"
+    cert_country: "{{ cert_config.country | default(omit) }}"
+    cert_ou: "{{ cert_config.ou | default(omit) }}"
+    cert_state: "{{ cert_config.state | default(omit) }}"
+    cert_locality: "{{ cert_config.locality | default(omit) }}"
+  register: _cert_issued
+
+- name: "Download certificate (PEM): {{ _cert_name }}"
+  when: _cert_format == 'pem'
+  block:
+    - name: Download certificate file
+      oriolrius.pki_manager.pki_manager:
+        action: cert_download
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        validate_certs: "{{ pki_validate_certs }}"
+        cert_id: "{{ _cert_issued.cert_id }}"
+        download_format: "pem"
+        download_dest: "{{ pki_cert_dir }}/{{ _cert_filename }}"
+      register: _cert_downloaded
+
+    - name: Set certificate file permissions
+      ansible.builtin.file:
+        path: "{{ pki_cert_dir }}/{{ _cert_filename }}"
+        owner: "{{ _cert_owner }}"
+        group: "{{ _cert_group }}"
+        mode: "0644"
+
+    - name: Download private key
+      oriolrius.pki_manager.pki_manager:
+        action: cert_download
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        validate_certs: "{{ pki_validate_certs }}"
+        cert_id: "{{ _cert_issued.cert_id }}"
+        download_format: "key-pem"
+        download_dest: "{{ pki_key_dir }}/{{ _cert_key_filename }}"
+      register: _key_downloaded
+
+    - name: Set private key permissions
+      ansible.builtin.file:
+        path: "{{ pki_key_dir }}/{{ _cert_key_filename }}"
+        owner: "{{ _cert_owner }}"
+        group: "{{ _cert_key_group }}"
+        mode: "0640"
+
+    - name: Download certificate chain
+      oriolrius.pki_manager.pki_manager:
+        action: cert_download
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        validate_certs: "{{ pki_validate_certs }}"
+        cert_id: "{{ _cert_issued.cert_id }}"
+        download_format: "chain-pem"
+        download_dest: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
+
+    - name: Set chain file permissions
+      ansible.builtin.file:
+        path: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
+        owner: "{{ _cert_owner }}"
+        group: "{{ _cert_group }}"
+        mode: "0644"
+
+    - name: Download full chain (cert + chain)
+      oriolrius.pki_manager.pki_manager:
+        action: cert_download
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        validate_certs: "{{ pki_validate_certs }}"
+        cert_id: "{{ _cert_issued.cert_id }}"
+        download_format: "full-pem"
+        download_dest: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}"
+
+    - name: Set fullchain file permissions
+      ansible.builtin.file:
+        path: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}"
+        owner: "{{ _cert_owner }}"
+        group: "{{ _cert_group }}"
+        mode: "0644"
+
+- name: "Download certificate (PKCS12): {{ _cert_name }}"
+  when: _cert_format in ['p12', 'pfx']
+  block:
+    - name: Validate password is provided for PKCS12
+      ansible.builtin.assert:
+        that:
+          - _cert_password is defined
+          - _cert_password | length > 0
+        fail_msg: "Password is required for PKCS12/PFX format"
+
+    - name: Download PKCS12 file
+      oriolrius.pki_manager.pki_manager:
+        action: cert_download
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        validate_certs: "{{ pki_validate_certs }}"
+        cert_id: "{{ _cert_issued.cert_id }}"
+        download_format: "p12"
+        download_password: "{{ _cert_password }}"
+        download_dest: "{{ pki_key_dir }}/{{ _cert_p12_filename }}"
+      register: _p12_downloaded
+
+    - name: Set PKCS12 file permissions
+      ansible.builtin.file:
+        path: "{{ pki_key_dir }}/{{ _cert_p12_filename }}"
+        owner: "{{ _cert_owner }}"
+        group: "{{ _cert_key_group }}"
+        mode: "0640"
+
+- name: Store certificate info for later use
+  ansible.builtin.set_fact:
+    pki_issued_certificates: "{{ pki_issued_certificates | default({}) | combine({_cert_name: {'cert_id': _cert_issued.cert_id, 'cn': _cert_cn, 'cert_path': pki_cert_dir + '/' + _cert_filename, 'key_path': pki_key_dir + '/' + _cert_key_filename, 'chain_path': pki_cert_dir + '/' + _cert_chain_filename, 'fullchain_path': pki_cert_dir + '/' + _cert_fullchain_filename}}) }}"
+
+- name: Notify handlers for certificate changes
+  when:
+    - _cert_notify | length > 0
+    - _cert_issued.changed or (_cert_downloaded.changed | default(false)) or (_key_downloaded.changed | default(false)) or (_p12_downloaded.changed | default(false))
+  ansible.builtin.debug:
+    msg: "Certificate {{ _cert_name }} changed, notifying: {{ _cert_notify }}"
+  changed_when: true
+  notify: "{{ _cert_notify }}"

@@ -1,0 +1,30 @@
+---
+# Handlers are defined by the user in their playbook
+# This file provides common handler examples that can be included
+
+# Example handlers (not automatically included):
+#
+# - name: restart nginx
+#   ansible.builtin.service:
+#     name: nginx
+#     state: restarted
+#
+# - name: reload nginx
+#   ansible.builtin.service:
+#     name: nginx
+#     state: reloaded
+#
+# - name: restart apache2
+#   ansible.builtin.service:
+#     name: apache2
+#     state: restarted
+#
+# - name: reload haproxy
+#   ansible.builtin.service:
+#     name: haproxy
+#     state: reloaded
+#
+# - name: restart docker
+#   ansible.builtin.service:
+#     name: docker
+#     state: restarted

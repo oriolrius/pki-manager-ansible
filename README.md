@@ -1,9 +1,11 @@
 # PKI Manager Ansible Collection
 
-Ansible module for managing X.509 certificates via PKI Manager API.
+Ansible collection for managing X.509 certificates via PKI Manager API.
 
 ## Features
 
+- **Module (`pki_manager`)**: Full API access for CA and certificate operations
+- **Role (`pki_host_setup`)**: Automated host certificate provisioning for Ubuntu
 - OIDC authentication with automatic token caching
 - CA management (create, list, get, revoke, delete)
 - Certificate management (issue, list, get, renew, revoke, delete)
@@ -11,6 +13,11 @@ Ansible module for managing X.509 certificates via PKI Manager API.
 - Search across CAs and certificates
 - Statistics and expiring certificates monitoring
 - Check mode support
+
+## Supported Platforms (Role)
+
+- Ubuntu 22.04 (Jammy)
+- Ubuntu 24.04 (Noble)
 
 ## Installation
 
@@ -90,6 +97,99 @@ Or using fully qualified collection name (FQCN):
     api_url: "{{ pki_api_url }}"
     # ... other parameters
 ```
+
+## Host Setup Role
+
+The `pki_host_setup` role automates certificate provisioning for Ubuntu hosts. It issues certificates with the hostname as CN, installs them in standard locations, and optionally notifies services to reload.
+
+### Basic Role Usage
+
+```yaml
+- name: Setup host certificates
+  hosts: webservers
+  become: true
+  collections:
+    - oriolrius.pki_manager
+
+  vars:
+    pki_api_url: "https://pki.example.com/api/v1"
+    pki_oidc_url: "https://iam.example.com/realms/pki/protocol/openid-connect/token"
+    pki_client_id: "{{ lookup('env', 'PKI_CLIENT_ID') }}"
+    pki_client_secret: "{{ lookup('env', 'PKI_CLIENT_SECRET') }}"
+    pki_ca_id: "your-ca-id"
+
+    pki_certificates:
+      - name: "nginx"
+        dns_names:
+          - "{{ ansible_fqdn }}"
+          - "web.example.com"
+        notify:
+          - reload nginx
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+  roles:
+    - pki_host_setup
+```
+
+### Multiple Certificates
+
+```yaml
+pki_certificates:
+  # Web server certificate
+  - name: "nginx"
+    type: "server"
+    dns_names:
+      - "web.example.com"
+      - "www.example.com"
+    ip_addresses:
+      - "10.0.0.10"
+    notify:
+      - reload nginx
+
+  # API server certificate
+  - name: "api"
+    type: "server"
+    dns_names:
+      - "api.example.com"
+    notify:
+      - restart api
+
+  # Client certificate for mTLS
+  - name: "mtls-client"
+    type: "client"
+    format: "p12"
+    password: "{{ vault_password }}"
+```
+
+### Certificate Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `name` | hostname | Certificate identifier |
+| `cn` | FQDN | Common Name |
+| `type` | server | server, client, email, code_signing |
+| `dns_names` | [FQDN, hostname] | DNS SAN entries |
+| `ip_addresses` | [default_ipv4] | IP SAN entries |
+| `validity` | 365 | Days |
+| `format` | pem | pem, p12, pfx |
+| `password` | - | Required for p12/pfx |
+| `notify` | [] | Handlers to trigger |
+
+### Installed Files (PEM format)
+
+| File | Location | Permissions |
+|------|----------|-------------|
+| Certificate | `/etc/ssl/certs/<name>.crt` | 0644 root:root |
+| Private Key | `/etc/ssl/private/<name>.key` | 0640 root:ssl-cert |
+| CA Chain | `/etc/ssl/certs/<name>-chain.crt` | 0644 root:root |
+| Full Chain | `/etc/ssl/certs/<name>-fullchain.crt` | 0644 root:root |
+
+See [roles/pki_host_setup/README.md](roles/pki_host_setup/README.md) for complete documentation.
 
 ## Available Actions
 

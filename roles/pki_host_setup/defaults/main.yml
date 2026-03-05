@@ -1,0 +1,61 @@
+---
+# PKI Manager connection settings
+pki_api_url: ""
+pki_oidc_url: ""
+pki_client_id: ""
+pki_client_secret: ""
+pki_validate_certs: true
+
+# CA to use for issuing certificates
+pki_ca_id: ""
+
+# Whether to install the CA certificate in system trust store
+pki_install_ca_trust: true
+
+# Base directories for certificate installation (Ubuntu defaults)
+pki_cert_dir: "/etc/ssl/certs"
+pki_key_dir: "/etc/ssl/private"
+pki_ca_trust_dir: "/usr/local/share/ca-certificates"
+
+# Default certificate settings
+pki_cert_validity: 365
+pki_cert_algorithm: "RSA-2048"
+
+# List of certificates to issue and install
+# Each certificate can have:
+#   - name: identifier for the certificate (default: ansible_hostname)
+#   - cn: Common Name (default: ansible_fqdn or ansible_hostname)
+#   - type: server, client, email, code_signing (default: server)
+#   - dns_names: list of DNS SANs (default: [ansible_fqdn, ansible_hostname])
+#   - ip_addresses: list of IP SANs (default: [ansible_default_ipv4.address])
+#   - validity: days (default: pki_cert_validity)
+#   - format: pem, p12, pfx (default: pem)
+#   - password: for p12/pfx formats
+#   - cert_filename: custom filename (default: <name>.crt)
+#   - key_filename: custom filename (default: <name>.key)
+#   - chain_filename: custom filename (default: <name>-chain.crt)
+#   - fullchain_filename: custom filename (default: <name>-fullchain.crt)
+#   - owner: file owner (default: root)
+#   - group: file group (default: root for certs, ssl-cert for keys)
+#   - notify: list of handlers to notify on change
+pki_certificates: []
+
+# Example:
+# pki_certificates:
+#   - name: "nginx"
+#     type: "server"
+#     dns_names:
+#       - "webserver.example.com"
+#       - "www.example.com"
+#     ip_addresses:
+#       - "10.0.0.10"
+#     notify:
+#       - restart nginx
+#
+#   - name: "haproxy"
+#     type: "server"
+#     format: "pem"
+#     dns_names:
+#       - "lb.example.com"
+#     notify:
+#       - reload haproxy
