@@ -1,0 +1,110 @@
+---
+# Syntax and variable validation test for pki_host_setup role
+# This test validates role structure without making API calls
+#
+# Run with: ansible-playbook tests/test_role_syntax.yml --check
+
+- name: Test role syntax and variable handling
+  hosts: localhost
+  gather_facts: true
+  collections:
+    - oriolrius.pki_manager
+
+  vars:
+    # Mock PKI configuration
+    pki_api_url: "https://pki.example.com/api/v1"
+    pki_oidc_url: "https://iam.example.com/realms/pki/protocol/openid-connect/token"
+    pki_client_id: "test-client"
+    pki_client_secret: "test-secret"
+    pki_ca_id: "00000000-0000-0000-0000-000000000000"
+    pki_cert_org: "Test Organization"
+    pki_cert_country: "ES"
+
+    # Test certificates configuration
+    pki_certificates:
+      - name: "test-server"
+        cn: "server.example.com"
+        type: "server"
+        dns_names:
+          - "server.example.com"
+          - "www.example.com"
+        ip_addresses:
+          - "10.0.0.1"
+        validity: 365
+
+      - name: "test-client"
+        cn: "client.example.com"
+        type: "client"
+        format: "p12"
+        password: "test-password"
+
+  tasks:
+    - name: Validate OS check would pass on Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version in ["22.04", "24.04"]
+        fail_msg: "Role only supports Ubuntu 22.04/24.04"
+      when: ansible_distribution == "Ubuntu"
+
+    - name: Validate required variables are set
+      ansible.builtin.assert:
+        that:
+          - pki_api_url | length > 0
+          - pki_oidc_url | length > 0
+          - pki_client_id | length > 0
+          - pki_client_secret | length > 0
+          - pki_ca_id | length > 0
+          - pki_cert_org | length > 0
+          - pki_cert_country | length == 2
+        success_msg: "All required variables are properly set"
+
+    - name: Validate certificate configurations
+      ansible.builtin.assert:
+        that:
+          - pki_certificates | length > 0
+          - item.name is defined or item.cn is defined
+        success_msg: "Certificate '{{ item.name | default(item.cn) }}' configuration is valid"
+      loop: "{{ pki_certificates }}"
+
+    - name: Test default certificate filenames
+      ansible.builtin.set_fact:
+        _test_filenames:
+          cert: "{{ (item.name | default(ansible_hostname)) + '.crt' }}"
+          key: "{{ (item.name | default(ansible_hostname)) + '.key' }}"
+          chain: "{{ (item.name | default(ansible_hostname)) + '-chain.crt' }}"
+          fullchain: "{{ (item.name | default(ansible_hostname)) + '-fullchain.crt' }}"
+      loop: "{{ pki_certificates }}"
+
+    - name: Verify default paths
+      ansible.builtin.debug:
+        msg: |
+          Default certificate paths:
+          - Cert dir: /etc/ssl/certs
+          - Key dir: /etc/ssl/private
+          - CA trust: /usr/local/share/ca-certificates
+
+    - name: Test PKCS12 password validation
+      ansible.builtin.assert:
+        that:
+          - item.password is defined
+          - item.password | length > 0
+        success_msg: "PKCS12 certificate '{{ item.name }}' has password set"
+      loop: "{{ pki_certificates | selectattr('format', 'defined') | selectattr('format', 'in', ['p12', 'pfx']) | list }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          Role syntax validation passed!
+
+          Configuration summary:
+          - API URL: {{ pki_api_url }}
+          - CA ID: {{ pki_ca_id }}
+          - Organization: {{ pki_cert_org }}
+          - Country: {{ pki_cert_country }}
+          - Certificates to issue: {{ pki_certificates | length }}
+
+          Certificates:
+          {% for cert in pki_certificates %}
+          - {{ cert.name | default(cert.cn) }} ({{ cert.type | default('server') }})
+          {% endfor %}

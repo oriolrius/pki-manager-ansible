@@ -1,0 +1,95 @@
+---
+# Example: Setup certificates for a web server
+#
+# This playbook demonstrates typical usage of the pki_host_setup role
+# to provision TLS certificates for nginx/apache web servers.
+#
+# Usage:
+#   ansible-playbook examples/webserver_setup.yml -i inventory.yml
+#
+# Required variables (set in inventory or vault):
+#   - pki_api_url
+#   - pki_oidc_url
+#   - pki_client_id
+#   - pki_client_secret
+#   - pki_ca_id
+
+- name: Setup web server certificates
+  hosts: webservers
+  become: true
+  collections:
+    - oriolrius.pki_manager
+
+  vars:
+    # PKI Manager connection (use vault for secrets)
+    pki_api_url: "{{ lookup('env', 'PKI_API_URL') }}"
+    pki_oidc_url: "{{ lookup('env', 'PKI_OIDC_URL') }}"
+    pki_client_id: "{{ lookup('env', 'PKI_CLIENT_ID') }}"
+    pki_client_secret: "{{ lookup('env', 'PKI_CLIENT_SECRET') }}"
+    pki_ca_id: "{{ lookup('env', 'PKI_CA_ID') }}"
+
+    # Certificate subject defaults
+    pki_cert_org: "My Company"
+    pki_cert_country: "ES"
+
+    # Certificates to issue
+    pki_certificates:
+      # Main website certificate
+      - name: "nginx-main"
+        cn: "www.example.com"
+        type: "server"
+        dns_names:
+          - "www.example.com"
+          - "example.com"
+          - "{{ inventory_hostname }}"
+        ip_addresses:
+          - "{{ ansible_default_ipv4.address }}"
+        validity: 365
+        notify:
+          - reload nginx
+
+      # API endpoint certificate
+      - name: "nginx-api"
+        cn: "api.example.com"
+        type: "server"
+        dns_names:
+          - "api.example.com"
+        notify:
+          - reload nginx
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+  pre_tasks:
+    - name: Ensure nginx is installed
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+  roles:
+    - pki_host_setup
+
+  post_tasks:
+    - name: Configure nginx SSL
+      ansible.builtin.template:
+        src: nginx-ssl.conf.j2
+        dest: /etc/nginx/sites-available/ssl.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Show certificate paths
+      ansible.builtin.debug:
+        msg: |
+          Certificates installed:
+          {% for name, info in pki_issued_certificates.items() %}
+          - {{ name }}:
+              cert: {{ info.cert_path }}
+              key: {{ info.key_path }}
+              fullchain: {{ info.fullchain_path }}
+          {% endfor %}
