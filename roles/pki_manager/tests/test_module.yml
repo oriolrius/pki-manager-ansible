@@ -1,0 +1,326 @@
+---
+# Test playbook for PKI Manager module
+# Run with: ansible-playbook tests/test_module.yml
+#
+# Required environment variables:
+#   PKI_API_URL - PKI Manager API URL
+#   PKI_OIDC_URL - OIDC token endpoint
+#   PKI_CLIENT_ID - OIDC client ID
+#   PKI_CLIENT_SECRET - OIDC client secret
+
+- name: Test PKI Manager module
+  hosts: localhost
+  gather_facts: true
+  vars:
+    pki_api_url: "{{ lookup('env', 'PKI_API_URL') }}"
+    pki_oidc_url: "{{ lookup('env', 'PKI_OIDC_URL') }}"
+    pki_client_id: "{{ lookup('env', 'PKI_CLIENT_ID') }}"
+    pki_client_secret: "{{ lookup('env', 'PKI_CLIENT_SECRET') }}"
+    test_ca_cn: "Test CA - Module {{ ansible_date_time.iso8601_basic_short }}"
+    test_ca_org: "Test Organization"
+    test_ca_country: "ES"
+    test_cert_cn: "test-module.example.com"
+
+  tasks:
+    # ==================== Authentication Tests ====================
+    - name: Test authentication
+      pki_manager:
+        action: auth_test
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+      register: auth_result
+
+    - name: Display auth result
+      ansible.builtin.debug:
+        var: auth_result
+
+    # ==================== Statistics Tests ====================
+    - name: Get PKI statistics
+      pki_manager:
+        action: stats
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+      register: stats_result
+
+    - name: Display statistics
+      ansible.builtin.debug:
+        var: stats_result.stats
+
+    # ==================== CA Tests ====================
+    - name: List existing CAs
+      pki_manager:
+        action: ca_list
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+      register: ca_list_result
+
+    - name: Display CA count
+      ansible.builtin.debug:
+        msg: "Found {{ ca_list_result.ca_count }} CAs"
+
+    - name: Create a test CA
+      pki_manager:
+        action: ca_create
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        ca_cn: "{{ test_ca_cn }}"
+        ca_org: "{{ test_ca_org }}"
+        ca_country: "{{ test_ca_country }}"
+        ca_validity: 365
+      register: ca_create_result
+
+    - name: Display created CA
+      ansible.builtin.debug:
+        msg: "Created CA with ID: {{ ca_create_result.ca_id }}"
+
+    - name: Get CA details
+      pki_manager:
+        action: ca_get
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        ca_id: "{{ ca_create_result.ca_id }}"
+      register: ca_get_result
+
+    - name: Verify CA details
+      ansible.builtin.assert:
+        that:
+          - ca_get_result.ca is defined
+          - ca_get_result.ca.id == ca_create_result.ca_id
+        fail_msg: "CA details do not match"
+
+    # ==================== Certificate Tests ====================
+    - name: Issue a test certificate
+      pki_manager:
+        action: cert_issue
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        ca_id: "{{ ca_create_result.ca_id }}"
+        cert_cn: "{{ test_cert_cn }}"
+        cert_org: "{{ test_ca_org }}"
+        cert_country: "{{ test_ca_country }}"
+        cert_type: "server"
+        cert_dns_names:
+          - "{{ test_cert_cn }}"
+          - "www.example.com"
+        cert_validity: 30
+      register: cert_issue_result
+
+    - name: Display issued certificate
+      ansible.builtin.debug:
+        msg: "Issued certificate with ID: {{ cert_issue_result.cert_id }}"
+
+    - name: Get certificate details
+      pki_manager:
+        action: cert_get
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        cert_id: "{{ cert_issue_result.cert_id }}"
+      register: cert_get_result
+
+    - name: Verify certificate details
+      ansible.builtin.assert:
+        that:
+          - cert_get_result.certificate is defined
+          - cert_get_result.certificate.id == cert_issue_result.cert_id
+
+    - name: List certificates
+      pki_manager:
+        action: cert_list
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+      register: cert_list_result
+
+    - name: Display certificate count
+      ansible.builtin.debug:
+        msg: "Found {{ cert_list_result.cert_count }} certificates"
+
+    # ==================== Download Tests ====================
+    - name: Download certificate as PEM
+      pki_manager:
+        action: cert_download
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        cert_id: "{{ cert_issue_result.cert_id }}"
+        download_format: pem
+        download_dest: "/tmp/pki_module_test/cert.pem"
+      register: download_pem_result
+
+    - name: Verify PEM file was downloaded
+      ansible.builtin.stat:
+        path: "{{ download_pem_result.downloaded_file }}"
+      register: pem_file
+
+    - name: Assert PEM file exists
+      ansible.builtin.assert:
+        that:
+          - pem_file.stat.exists
+
+    - name: Download certificate as P12
+      pki_manager:
+        action: cert_download
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        cert_id: "{{ cert_issue_result.cert_id }}"
+        download_format: p12
+        download_password: "testpassword123"
+        download_dest: "/tmp/pki_module_test/cert.p12"
+      register: download_p12_result
+
+    - name: Verify P12 file was downloaded
+      ansible.builtin.stat:
+        path: "{{ download_p12_result.downloaded_file }}"
+      register: p12_file
+
+    - name: Assert P12 file exists
+      ansible.builtin.assert:
+        that:
+          - p12_file.stat.exists
+
+    # ==================== Search Tests ====================
+    - name: Search for test certificate
+      pki_manager:
+        action: search
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        search_query: "{{ test_cert_cn }}"
+      register: search_result
+
+    - name: Display search results
+      ansible.builtin.debug:
+        msg: "Found {{ search_result.total_count }} results"
+
+    # ==================== Expiring Tests ====================
+    - name: Get expiring certificates
+      pki_manager:
+        action: expiring
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        expiring_limit: 10
+      register: expiring_result
+
+    - name: Display expiring certificates
+      ansible.builtin.debug:
+        msg: "{{ expiring_result.msg }}"
+
+    # ==================== Renewal Tests ====================
+    - name: Renew the test certificate
+      pki_manager:
+        action: cert_renew
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        cert_id: "{{ cert_issue_result.cert_id }}"
+        cert_validity: 60
+      register: renew_result
+
+    - name: Display renewed certificate
+      ansible.builtin.debug:
+        msg: "Renewed certificate, new ID: {{ renew_result.new_cert_id }}"
+
+    # ==================== Revocation Tests ====================
+    - name: Revoke the original certificate
+      pki_manager:
+        action: cert_revoke
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        cert_id: "{{ cert_issue_result.cert_id }}"
+        revocation_reason: "superseded"
+      register: revoke_result
+
+    - name: Display revocation result
+      ansible.builtin.debug:
+        msg: "{{ revoke_result.msg }}"
+
+    # ==================== Cleanup ====================
+    - name: Delete the renewed certificate (expected to be blocked)
+      pki_manager:
+        action: cert_delete
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        cert_id: "{{ renew_result.new_cert_id }}"
+      register: delete_renewed_result
+
+    - name: Display delete result
+      ansible.builtin.debug:
+        msg: "{{ delete_renewed_result.msg }}"
+
+    - name: Delete the original certificate (expected to be blocked)
+      pki_manager:
+        action: cert_delete
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        cert_id: "{{ cert_issue_result.cert_id }}"
+      register: delete_original_result
+
+    - name: Display delete result
+      ansible.builtin.debug:
+        msg: "{{ delete_original_result.msg }}"
+
+    - name: Revoke the test CA
+      pki_manager:
+        action: ca_revoke
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        ca_id: "{{ ca_create_result.ca_id }}"
+        revocation_reason: "cessationOfOperation"
+      register: ca_revoke_result
+
+    - name: Display CA revocation result
+      ansible.builtin.debug:
+        msg: "{{ ca_revoke_result.msg }}"
+
+    - name: Delete the test CA
+      pki_manager:
+        action: ca_delete
+        api_url: "{{ pki_api_url }}"
+        oidc_url: "{{ pki_oidc_url }}"
+        client_id: "{{ pki_client_id }}"
+        client_secret: "{{ pki_client_secret }}"
+        ca_id: "{{ ca_create_result.ca_id }}"
+      register: ca_delete_result
+
+    - name: Display CA delete result
+      ansible.builtin.debug:
+        msg: "{{ ca_delete_result.msg }}"
+
+    - name: Clean up test files
+      ansible.builtin.file:
+        path: "/tmp/pki_module_test"
+        state: absent
+
+    - name: All tests passed
+      ansible.builtin.debug:
+        msg: "All PKI Manager module tests completed successfully!"

@@ -1,0 +1,99 @@
+---
+# Main entry point using the pki_manager module
+# This provides a cleaner, more maintainable approach
+
+- name: Validate required configuration
+  ansible.builtin.assert:
+    that:
+      - pki_api_url is defined
+      - pki_api_url | length > 0
+      - pki_oidc_url is defined
+      - pki_oidc_url | length > 0
+      - pki_client_id is defined
+      - pki_client_id | length > 0
+      - pki_client_secret is defined
+      - pki_client_secret | length > 0
+    fail_msg: "PKI Manager configuration incomplete. Set pki_api_url, pki_oidc_url, pki_client_id, and pki_client_secret"
+    quiet: true
+
+- name: Validate pki_action is set
+  ansible.builtin.assert:
+    that:
+      - pki_action is defined
+      - pki_action | length > 0
+    fail_msg: "pki_action must be specified"
+    quiet: true
+
+# Execute the requested action using the module
+- name: Execute PKI Manager action
+  pki_manager:
+    action: "{{ pki_action }}"
+    api_url: "{{ pki_api_url }}"
+    oidc_url: "{{ pki_oidc_url }}"
+    client_id: "{{ pki_client_id }}"
+    client_secret: "{{ pki_client_secret }}"
+    # CA options
+    ca_id: "{{ pki_ca_id | default(omit) }}"
+    ca_cn: "{{ pki_ca_cn | default(omit) }}"
+    ca_org: "{{ pki_ca_org | default(omit) }}"
+    ca_country: "{{ pki_ca_country | default(omit) }}"
+    ca_ou: "{{ pki_ca_ou | default(omit) }}"
+    ca_state: "{{ pki_ca_state | default(omit) }}"
+    ca_locality: "{{ pki_ca_locality | default(omit) }}"
+    ca_algorithm: "{{ pki_ca_algorithm | default(omit) }}"
+    ca_validity: "{{ pki_ca_validity | default(omit) }}"
+    # Certificate options
+    cert_id: "{{ pki_cert_id | default(omit) }}"
+    cert_cn: "{{ pki_cert_cn | default(omit) }}"
+    cert_org: "{{ pki_cert_org | default(omit) }}"
+    cert_country: "{{ pki_cert_country | default(omit) }}"
+    cert_ou: "{{ pki_cert_ou | default(omit) }}"
+    cert_state: "{{ pki_cert_state | default(omit) }}"
+    cert_locality: "{{ pki_cert_locality | default(omit) }}"
+    cert_type: "{{ pki_cert_type | default(omit) }}"
+    cert_algorithm: "{{ pki_cert_algorithm | default(omit) }}"
+    cert_validity: "{{ pki_cert_validity | default(omit) }}"
+    cert_dns_names: "{{ pki_cert_dns_names | default(omit) }}"
+    cert_ip_addresses: "{{ pki_cert_ip_addresses | default(omit) }}"
+    cert_emails: "{{ pki_cert_emails | default(omit) }}"
+    # Revocation
+    revocation_reason: "{{ pki_revocation_reason | default(omit) }}"
+    # Download
+    download_format: "{{ pki_download_format | default(omit) }}"
+    download_password: "{{ pki_download_password | default(omit) }}"
+    download_dest: "{{ pki_download_dest | default(omit) }}"
+    # Search
+    search_query: "{{ pki_search_query | default(omit) }}"
+    search_limit: "{{ pki_search_limit | default(omit) }}"
+    expiring_limit: "{{ pki_expiring_limit | default(omit) }}"
+    # Connection
+    validate_certs: "{{ pki_validate_certs | default(true) }}"
+    timeout: "{{ pki_api_timeout | default(30) }}"
+    token_cache_path: "{{ pki_token_cache_path | default('/tmp/.pki_token_cache') }}"
+  register: pki_result
+
+# Export common result variables for backwards compatibility
+- name: Set result facts
+  ansible.builtin.set_fact:
+    pki_ca: "{{ pki_result.ca | default(omit) }}"
+    pki_ca_id: "{{ pki_result.ca_id | default(pki_result.ca.id | default(omit)) }}"
+    pki_cas: "{{ pki_result.cas | default(omit) }}"
+    pki_ca_count: "{{ pki_result.ca_count | default(omit) }}"
+    pki_certificate: "{{ pki_result.certificate | default(omit) }}"
+    pki_cert_id: "{{ pki_result.cert_id | default(pki_result.certificate.id | default(omit)) }}"
+    pki_new_cert_id: "{{ pki_result.new_cert_id | default(omit) }}"
+    pki_certificates: "{{ pki_result.certificates | default(omit) }}"
+    pki_cert_count: "{{ pki_result.cert_count | default(omit) }}"
+    pki_stats: "{{ pki_result.stats | default(omit) }}"
+    pki_search_results: "{{ pki_result.search_results | default(omit) }}"
+    pki_search_count: "{{ pki_result.total_count | default(omit) }}"
+    pki_expiring_certs: "{{ pki_result.expiring | default(omit) }}"
+    pki_downloaded_file: "{{ pki_result.downloaded_file | default(omit) }}"
+  when: pki_result is defined
+
+- name: Display result message
+  ansible.builtin.debug:
+    msg: "{{ pki_result.msg }}"
+  when:
+    - not (pki_quiet | default(false))
+    - pki_result.msg is defined
