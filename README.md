@@ -431,5 +431,8 @@ Oriol Rius - [joor.net](https://joor.net)
 
 ## Related Projects
 
-- [PKI Manager](https://github.com/oriolrius/pki-manager) - Main PKI Manager application
-- [PKI Manager CLI](https://github.com/oriolrius/pki-manager-cli) - Python CLI tool
+| Project | Description |
+|---------|-------------|
+| [PKI Manager](https://github.com/oriolrius/pki-manager-web) | Main PKI Manager web application |
+| [PKI Manager CLI](https://github.com/oriolrius/pki-manager-cli) | Python CLI tool for PKI Manager |
+| [PKI Manager Skill](https://github.com/oriolrius/pki-manager-skill) | Claude Code skill for AI-assisted certificate management |
