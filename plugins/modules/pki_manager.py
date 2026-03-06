@@ -131,7 +131,7 @@ options:
         description:
             - Certificate type.
         type: str
-        choices: ['server', 'client', 'email', 'code_signing']
+        choices: ['server', 'client', 'dual', 'email', 'code_signing']
         default: 'server'
     cert_algorithm:
         description:
@@ -788,7 +788,7 @@ def run_module():
         cert_ou=dict(type='str'),
         cert_state=dict(type='str'),
         cert_locality=dict(type='str'),
-        cert_type=dict(type='str', default='server', choices=['server', 'client', 'email', 'code_signing']),
+        cert_type=dict(type='str', default='server', choices=['server', 'client', 'dual', 'email', 'code_signing']),
         cert_algorithm=dict(type='str', default='RSA-2048', choices=['RSA-2048', 'RSA-4096', 'ECDSA-P256', 'ECDSA-P384']),
         cert_validity=dict(type='int', default=365),
         cert_dns_names=dict(type='list', elements='str'),

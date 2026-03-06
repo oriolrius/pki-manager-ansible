@@ -172,7 +172,7 @@ pki_certificates:
 |--------|---------|-------------|
 | `name` | hostname | Certificate identifier |
 | `cn` | FQDN | Common Name |
-| `type` | server | server, client, email, code_signing |
+| `type` | server | server, client, dual, email, code_signing |
 | `dns_names` | [FQDN, hostname] | DNS SAN entries |
 | `ip_addresses` | [default_ipv4] | IP SAN entries |
 | `validity` | 365 | Days |
@@ -249,7 +249,7 @@ See [roles/pki_host_setup/README.md](roles/pki_host_setup/README.md) for complet
 | `cert_cn` | Common Name |
 | `cert_org` | Organization |
 | `cert_country` | Country (2-letter code) |
-| `cert_type` | Type: `server`, `client`, `email`, `code_signing` |
+| `cert_type` | Type: `server`, `client`, `dual`, `email`, `code_signing` |
 | `cert_algorithm` | Key algorithm (default: `RSA-2048`) |
 | `cert_validity` | Validity in days (default: 365) |
 | `cert_dns_names` | List of DNS SANs |

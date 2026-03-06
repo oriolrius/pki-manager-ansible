@@ -32,7 +32,7 @@ pki_cert_locality: ""  # Locality/City (optional)
 # Each certificate can have:
 #   - name: identifier for the certificate (default: ansible_hostname)
 #   - cn: Common Name (default: ansible_fqdn or ansible_hostname)
-#   - type: server, client, email, code_signing (default: server)
+#   - type: server, client, dual, email, code_signing (default: server)
 #   - dns_names: list of DNS SANs (default: [ansible_fqdn, ansible_hostname])
 #   - ip_addresses: list of IP SANs (default: [ansible_default_ipv4.address])
 #   - validity: days (default: pki_cert_validity)

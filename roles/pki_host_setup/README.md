@@ -59,7 +59,7 @@ pki_cert_algorithm: "RSA-2048"
 pki_certificates:
   - name: "webserver"              # Identifier (default: hostname)
     cn: "server.example.com"       # Common Name (default: FQDN)
-    type: "server"                 # server, client, email, code_signing
+    type: "server"                 # server, client, dual, email, code_signing
     dns_names:                     # DNS SANs (default: [FQDN, hostname])
       - "server.example.com"
       - "www.example.com"
