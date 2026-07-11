@@ -1,0 +1,46 @@
+---
+# User-CA trust bundle (TrustedUserCAKeys) — public REST download, via the module.
+- name: Fetch the User CA trust bundle (TrustedUserCAKeys)
+  oriolrius.pki_manager.pki_manager:
+    action: ssh_trusted_user_ca
+    api_url: "{{ ssh_host_cert_api_v1 }}"
+    validate_certs: "{{ ssh_host_cert_validate_certs }}"
+  register: ssh_host_cert_user_ca
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+- name: Install the User CA public key on the node
+  ansible.builtin.copy:
+    content: "{{ ssh_host_cert_user_ca.trusted_user_ca_keys }}"
+    dest: "{{ ssh_host_cert_user_ca_pub }}"
+    owner: root
+    group: root
+    mode: "0444"
+  become: true
+  notify:
+    - Reload sshd
+    - Reload sshd (SIGHUP)
+
+# The Host CA trust anchor MUST land before the per-host composed-KRL cutover
+# (BLK-10/BLK-12 runbook ordering): composed KRLs are signed with the HOST CA
+# key and krl-client verifies against this file by default — without it every
+# pull fails signature verification and blocks silently never land.
+- name: Fetch the Host CA trust anchor (KRL signature verification)
+  oriolrius.pki_manager.pki_manager:
+    action: ssh_host_ca
+    api_url: "{{ ssh_host_cert_api_v1 }}"
+    validate_certs: "{{ ssh_host_cert_validate_certs }}"
+  register: ssh_host_cert_host_ca
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+- name: Install the Host CA public key on the node (KRL puller trust anchor)
+  ansible.builtin.copy:
+    content: "{{ ssh_host_cert_host_ca.host_ca_keys }}"
+    dest: "{{ ssh_host_cert_host_ca_pub }}"
+    owner: root
+    group: root
+    mode: "0444"
+  become: true

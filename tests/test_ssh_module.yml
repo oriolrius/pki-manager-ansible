@@ -29,15 +29,22 @@
       loop:
         - /tmp/tmod_host.pub
         - /tmp/tmod_user.pub
-    - ansible.builtin.set_fact:
+
+    - name: Set public-key facts
+      ansible.builtin.set_fact:
         host_pub: "{{ _pubs.results[0].content | b64decode | trim }}"
         user_pub: "{{ _pubs.results[1].content | b64decode | trim }}"
 
     - name: Create the dual CA
-      oriolrius.pki_manager.pki_manager: { action: ssh_ca_create, ssh_ca_type: "{{ item }}", ssh_ca_label: "tmod-{{ item }}" }
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_ca_create
+        ssh_ca_type: "{{ item }}"
+        ssh_ca_label: "tmod-{{ item }}"
       loop: [user, host]
       register: _cas
-    - ansible.builtin.set_fact:
+
+    - name: Record the CA ids
+      ansible.builtin.set_fact:
         user_ca: "{{ _cas.results[0].ca_id }}"
         host_ca: "{{ _cas.results[1].ca_id }}"
 
@@ -48,18 +55,28 @@
         host_ca_id: "{{ host_ca }}"
         token_ops: [sign-host, get-principals, register-host-pubkey]
       register: _tok
-    - ansible.builtin.assert: { that: "_tok.token.startswith('pkimg_')" }
 
-    - name: Create identity + principal + grant entitlement
-      oriolrius.pki_manager.pki_manager: "{{ item }}"
-      loop:
-        - { action: ssh_identity_create, identity_subject: "alice@{{ fqdn }}" }
-        - { action: ssh_principal_create, principal_name: developers }
-      register: _idp
-    - ansible.builtin.set_fact:
-        ident: "{{ _idp.results[0].identity_id }}"
-        princ: "{{ _idp.results[1].principal_id }}"
-    - oriolrius.pki_manager.pki_manager: { action: ssh_principal_grant, identity_id: "{{ ident }}", principal_id: "{{ princ }}" }
+    - name: Assert the token looks minted
+      ansible.builtin.assert:
+        that: "_tok.token.startswith('pkimg_')"
+
+    - name: Create the identity
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_identity_create
+        identity_subject: "alice@{{ fqdn }}"
+      register: _ident
+
+    - name: Create the principal
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_create
+        principal_name: developers
+      register: _princ
+
+    - name: Grant the entitlement
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_grant
+        identity_id: "{{ _ident.identity_id }}"
+        principal_id: "{{ _princ.principal_id }}"
 
     - name: Sign the host cert (host-facing, fleet token) — registers the host
       oriolrius.pki_manager.pki_manager:
@@ -69,48 +86,107 @@
         fleet_token: "{{ _tok.token }}"
         idempotency_key: "tmod-{{ fqdn }}"
       register: _signed
-    - ansible.builtin.assert: { that: ["_signed.cert_openssh is search('ecdsa-sha2-nistp256-cert')", "_signed.host_id | length > 0"] }
+
+    - name: Assert an ecdsa host cert was signed
+      ansible.builtin.assert:
+        that:
+          - "_signed.cert_openssh is search('ecdsa-sha2-nistp256-cert')"
+          - "_signed.host_id | length > 0"
 
     - name: Resolve the host id by fqdn (REST list)
-      oriolrius.pki_manager.pki_manager: { action: ssh_host_list, host_fqdn: "{{ fqdn }}" }
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_host_list
+        host_fqdn: "{{ fqdn }}"
       register: _hl
-    - ansible.builtin.assert: { that: "_hl.host_id == _signed.host_id" }
 
-    - name: Map the principal to the deploy account, then render
-      oriolrius.pki_manager.pki_manager: { action: ssh_principal_map, host_id: "{{ _signed.host_id }}", principal_id: "{{ princ }}", local_account: deploy }
-    - oriolrius.pki_manager.pki_manager: { action: ssh_auth_principals, host_id: "{{ _signed.host_id }}" }
+    - name: Assert the resolved id matches
+      ansible.builtin.assert:
+        that: "_hl.host_id == _signed.host_id"
+
+    - name: Map the principal to the deploy account
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_map
+        host_id: "{{ _signed.host_id }}"
+        principal_id: "{{ _princ.principal_id }}"
+        local_account: deploy
+
+    - name: Render auth_principals (admin)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_auth_principals
+        host_id: "{{ _signed.host_id }}"
       register: _ap
-    - ansible.builtin.assert:
+
+    - name: Assert the dual-form render
+      ansible.builtin.assert:
         that: "_ap.auth_principals.files.deploy == 'developers\ndevelopers@' + fqdn + '\n'"
 
     - name: Host self-fetch of its principals (host-facing, fleet token)
-      oriolrius.pki_manager.pki_manager: { action: ssh_get_principals, host_fqdn: "{{ fqdn }}", fleet_token: "{{ _tok.token }}" }
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_get_principals
+        host_fqdn: "{{ fqdn }}"
+        fleet_token: "{{ _tok.token }}"
       register: _gp
-    - ansible.builtin.assert: { that: "_gp.auth_principals.files.deploy == _ap.auth_principals.files.deploy" }
+
+    - name: Assert host render matches admin render
+      ansible.builtin.assert:
+        that: "_gp.auth_principals.files.deploy == _ap.auth_principals.files.deploy"
+
+    - name: Render the authoritative sshd drop-in
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_sshd_config
+        host_id: "{{ _signed.host_id }}"
+      register: _dropin
+
+    - name: Assert the drop-in is algorithm-aware (ecdsa host)
+      ansible.builtin.assert:
+        that: "'ssh_host_ecdsa_key' in _dropin.sshd_config"
 
     - name: Register the ECIES key (host-facing) — 200 not 501/409
-      oriolrius.pki_manager.pki_manager: { action: ssh_register_host_pubkey, host_fqdn: "{{ fqdn }}", fleet_token: "{{ _tok.token }}" }
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_register_host_pubkey
+        host_fqdn: "{{ fqdn }}"
+        fleet_token: "{{ _tok.token }}"
 
     - name: Issue a user certificate
       oriolrius.pki_manager.pki_manager:
         action: ssh_user_issue
-        identity_id: "{{ ident }}"
+        identity_id: "{{ _ident.identity_id }}"
         user_ca_id: "{{ user_ca }}"
         ssh_public_key: "{{ user_pub }}"
         principals: [developers]
       register: _uc
-    - ansible.builtin.assert: { that: "_uc.cert_openssh is search('ssh-ed25519-cert')" }
 
-    - name: Fetch the client @cert-authority trust line + trust anchors
-      oriolrius.pki_manager.pki_manager: { action: ssh_cert_authority, cert_authority_pattern: "*.{{ fqdn }}" }
+    - name: Assert a user cert was issued
+      ansible.builtin.assert:
+        that: "_uc.cert_openssh is search('ssh-ed25519-cert')"
+
+    - name: Fetch the client @cert-authority trust line
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_cert_authority
+        cert_authority_pattern: "*.{{ fqdn }}"
       register: _ca
-    - ansible.builtin.assert: { that: "_ca.cert_authority.startswith('@cert-authority')" }
-    - oriolrius.pki_manager.pki_manager: { action: ssh_trusted_user_ca }
-    - oriolrius.pki_manager.pki_manager: { action: ssh_host_ca }
 
-    - name: Block then unblock the identity on the host
-      oriolrius.pki_manager.pki_manager: { action: ssh_block, host_id: "{{ _signed.host_id }}", identity_id: "{{ ident }}" }
-    - oriolrius.pki_manager.pki_manager: { action: ssh_unblock, host_id: "{{ _signed.host_id }}", identity_id: "{{ ident }}" }
+    - name: Assert the @cert-authority line
+      ansible.builtin.assert:
+        that: "_ca.cert_authority.startswith('@cert-authority')"
 
-    - ansible.builtin.debug:
+    - name: Fetch the trust anchors
+      oriolrius.pki_manager.pki_manager:
+        action: "{{ item }}"
+      loop: [ssh_trusted_user_ca, ssh_host_ca]
+
+    - name: Block the identity on the host
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_block
+        host_id: "{{ _signed.host_id }}"
+        identity_id: "{{ _ident.identity_id }}"
+
+    - name: Unblock the identity on the host
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_unblock
+        host_id: "{{ _signed.host_id }}"
+        identity_id: "{{ _ident.identity_id }}"
+
+    - name: Done
+      ansible.builtin.debug:
         msg: "ALL SSH MODULE ACTIONS PASSED against {{ api_url }}"

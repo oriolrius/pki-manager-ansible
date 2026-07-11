@@ -39,6 +39,26 @@ options:
             - cert_revoke
             - cert_delete
             - cert_download
+            - ssh_ca_create
+            - ssh_ca_list
+            - ssh_token_mint
+            - ssh_identity_create
+            - ssh_principal_create
+            - ssh_principal_grant
+            - ssh_principal_map
+            - ssh_user_issue
+            - ssh_host_register
+            - ssh_host_list
+            - ssh_block
+            - ssh_unblock
+            - ssh_auth_principals
+            - ssh_sshd_config
+            - ssh_cert_authority
+            - ssh_trusted_user_ca
+            - ssh_host_ca
+            - ssh_sign_host
+            - ssh_register_host_pubkey
+            - ssh_get_principals
     api_url:
         description:
             - PKI Manager API URL.
@@ -234,6 +254,88 @@ options:
             - Path to cache OIDC tokens.
         type: path
         default: '/tmp/.pki_token_cache'
+    fleet_token:
+        description:
+            - Fleet bearer token (pkimg_...) for the host-facing external SSH API
+              (ssh_sign_host, ssh_register_host_pubkey, ssh_get_principals).
+        type: str
+    ssh_ca_type:
+        description: SSH CA type for ssh_ca_create.
+        type: str
+        choices: ['user', 'host']
+    ssh_ca_label:
+        description: Optional label for ssh_ca_create.
+        type: str
+    token_name:
+        description: Name of the fleet token (ssh_token_mint).
+        type: str
+    token_ops:
+        description: Op-set for the fleet token (ssh_token_mint), e.g. sign-host, get-principals, register-host-pubkey.
+        type: list
+        elements: str
+    host_ca_id:
+        description: Host CA id (ssh_token_mint).
+        type: str
+    user_ca_id:
+        description: User CA id (ssh_token_mint, ssh_user_issue).
+        type: str
+    identity_id:
+        description: SSH identity id.
+        type: str
+    identity_subject:
+        description: Subject for ssh_identity_create.
+        type: str
+    identity_email:
+        description: Optional email for ssh_identity_create.
+        type: str
+    principal_id:
+        description: Principal id (ssh_principal_grant, ssh_principal_map).
+        type: str
+    principal_name:
+        description: Principal name for ssh_principal_create.
+        type: str
+    principal_description:
+        description: Optional description for ssh_principal_create.
+        type: str
+    host_id:
+        description: Server-side host id (ssh_principal_map, ssh_block, ssh_auth_principals, ssh_sshd_config).
+        type: str
+    host_fqdn:
+        description: Host FQDN (ssh_host_register/list, ssh_sign_host, ssh_register_host_pubkey, ssh_get_principals).
+        type: str
+    host_pubkey:
+        description: Host OpenSSH public key (ssh_host_register, ssh_sign_host).
+        type: str
+    host_addresses:
+        description: Host IP addresses (ssh_host_register, ssh_sign_host).
+        type: list
+        elements: str
+    local_account:
+        description: Local UNIX account for ssh_principal_map.
+        type: str
+    ssh_public_key:
+        description: User OpenSSH public key for ssh_user_issue.
+        type: str
+    principals:
+        description: Principals to encode in the user certificate (ssh_user_issue).
+        type: list
+        elements: str
+    user_valid_seconds:
+        description: Validity in seconds for the user cert / signed host cert.
+        type: int
+    enforce_entitlement:
+        description: Constrain issued principals to the identity's catalog entitlements (ssh_user_issue).
+        type: bool
+    cert_authority_pattern:
+        description: known_hosts pattern for ssh_cert_authority.
+        type: str
+        default: '*'
+    block_reason:
+        description: Optional reason for ssh_block.
+        type: str
+    idempotency_key:
+        description: Idempotency-Key header for ssh_sign_host.
+        type: str
 author:
     - Oriol Rius (@oriolrius)
 '''
@@ -936,6 +1038,14 @@ class PKIManagerClient:
         return {'changed': False, 'auth_principals': r['data'],
                 'msg': f"Rendered auth_principals for host {host_id}"}
 
+    def ssh_sshd_config(self, host_id):
+        """The authoritative, algorithm-aware sshd drop-in for a host."""
+        r = self._get_text(f"/ssh/hosts/{host_id}/sshd-config")
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, 'sshd_config': r['text'],
+                'msg': f"Rendered sshd drop-in for host {host_id}"}
+
     def ssh_cert_authority(self, pattern='*'):
         r = self._get_text(f"/ssh/cert-authority?pattern={quote(pattern)}")
         if r['error']:
@@ -1000,7 +1110,7 @@ def run_module():
             'ssh_ca_create', 'ssh_ca_list', 'ssh_token_mint',
             'ssh_identity_create', 'ssh_principal_create', 'ssh_principal_grant', 'ssh_principal_map',
             'ssh_user_issue', 'ssh_host_register', 'ssh_host_list',
-            'ssh_block', 'ssh_unblock', 'ssh_auth_principals',
+            'ssh_block', 'ssh_unblock', 'ssh_auth_principals', 'ssh_sshd_config',
             'ssh_cert_authority', 'ssh_trusted_user_ca', 'ssh_host_ca',
             # SSH workflow — host-facing (fleet-token)
             'ssh_sign_host', 'ssh_register_host_pubkey', 'ssh_get_principals',
@@ -1112,6 +1222,7 @@ def run_module():
             ('action', 'ssh_block', ['host_id', 'identity_id']),
             ('action', 'ssh_unblock', ['host_id', 'identity_id']),
             ('action', 'ssh_auth_principals', ['host_id']),
+            ('action', 'ssh_sshd_config', ['host_id']),
             ('action', 'ssh_sign_host', ['host_fqdn', 'host_pubkey', 'fleet_token']),
             ('action', 'ssh_register_host_pubkey', ['host_fqdn', 'fleet_token']),
             ('action', 'ssh_get_principals', ['host_fqdn', 'fleet_token']),
@@ -1341,6 +1452,9 @@ def run_module():
 
     elif action == 'ssh_auth_principals':
         result = client.ssh_auth_principals(module.params['host_id'])
+
+    elif action == 'ssh_sshd_config':
+        result = client.ssh_sshd_config(module.params['host_id'])
 
     elif action == 'ssh_cert_authority':
         result = client.ssh_cert_authority(module.params.get('cert_authority_pattern', '*'))

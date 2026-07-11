@@ -1,0 +1,18 @@
+# yamllint config for the oriolrius.pki_manager collection. The only long lines
+# are cron command bodies inside `content: |` literal blocks (cron requires the
+# whole command on one physical line), so line-length is a warning, not an error.
+extends: default
+
+rules:
+  line-length:
+    max: 200
+    level: warning
+  comments:
+    min-spaces-from-content: 1
+  truthy:
+    allowed-values: ["true", "false", "yes", "no"]
+  # Allow the compact `{ key: val }` flow-mapping style used in loops/examples.
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1
