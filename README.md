@@ -1,24 +1,55 @@
 # PKI Manager Ansible Collection
 
-Ansible collection for managing X.509 certificates via PKI Manager API.
+**`oriolrius.pki_manager`** — an Ansible collection for managing **both X.509 certificates and the SSH certificate workflow** through the PKI Manager REST API (one module plus two host-setup roles).
+
+- **Version:** 2.3.0
+- **Collection (FQCN):** `oriolrius.pki_manager`
+- **Requires:** Ansible `>=2.14.0`, `community.crypto >=2.0.0`
+- **Repository:** https://github.com/oriolrius/pki-manager-ansible
+
+---
 
 ## Features
 
-- **Module (`pki_manager`)**: Full REST API access for X.509 **and** the SSH certificate workflow
-- **Role (`pki_host_setup`)**: Automated X.509 host certificate provisioning for Ubuntu
-- **Role (`ssh_host_cert`)**: Provision a full SSH-CA node (host cert, trust anchors, login-RBAC principals, authoritative sshd drop-in, unattended renewal, encrypted-KRL revocation) — see [SSH Certificate Workflow](#ssh-certificate-workflow)
-- OIDC authentication with automatic token caching (optional — omit for a backend with OIDC disabled)
-- CA management (create, list, get, revoke, delete)
-- Certificate management (issue, list, get, renew, revoke, delete)
-- Certificate download in multiple formats (PEM, DER, P12, JKS, etc.)
-- Search across CAs and certificates
-- Statistics and expiring certificates monitoring
-- Check mode support
+The collection covers two co-equal certificate domains through a single `pki_manager` module plus dedicated roles. All API calls are REST — no `curl`, no tRPC.
 
-## Supported Platforms (Role)
+### X.509 certificates
 
-- Ubuntu 22.04 (Jammy)
-- Ubuntu 24.04 (Noble)
+- **CA lifecycle** — create, list, get, revoke, delete Certificate Authorities.
+- **Certificate lifecycle** — issue, list, get, renew, revoke, delete leaf certificates (`server`, `client`, `dual`, `email`, `code_signing`).
+- **Downloads** — export in 15 formats (PEM/DER, chain/full, key, CSR, PKCS#8, PKCS#12/PFX, JKS keystore/truststore).
+- **Search & dashboards** — search across CAs and certificates, PKI statistics, soon-expiring monitoring.
+- **`pki_host_setup` role** — provision Ubuntu hosts with issued X.509 certs installed to standard locations, with handler notifications.
+
+### SSH certificate authority
+
+- **SSH CAs** — create and list user/host SSH CAs.
+- **Fleet tokens** — mint scoped `pkimg_…` bearer tokens for host-facing operations.
+- **Identities, principals & host maps** — create identities, define principals, grant entitlements, and map principals to local accounts (login RBAC).
+- **User certificates** — issue SSH user certs against granted principals.
+- **Host certificates** — register host pubkeys, sign host certs, and (ECIES) register encrypted-KRL host keys — the private host key never leaves the node.
+- **Trust anchors & renders** — fetch `@cert-authority` lines, `TrustedUserCAKeys`/host-CA anchors, and render authoritative `auth_principals` / sshd drop-in files.
+- **Access blocks** — block/unblock an identity on a host.
+- **`ssh_host_cert` role** — turn a node into a full SSH-CA client: host key generation, cert install, trust anchors, login-RBAC principals, authoritative sshd drop-in, unattended renewal, and KRL revocation.
+
+### Shared
+
+- **OIDC authentication is optional** with automatic token caching — omit OIDC entirely for a backend running with `ALLOW_UNAUTHENTICATED_SSH_CA=true`, or use a fleet token for host-facing SSH actions.
+- **Check mode** — every state-changing action short-circuits to a `would …(check mode)` message; read-only actions run normally.
+
+---
+
+## Components
+
+| Component | Type | Purpose |
+|---|---|---|
+| `oriolrius.pki_manager.pki_manager` | Module | Full REST access to all 36 actions — 16 X.509 + 20 SSH. |
+| `oriolrius.pki_manager.pki_host_setup` | Role | Issue and install X.509 host certificates on Ubuntu. |
+| `oriolrius.pki_manager.ssh_host_cert` | Role | Provision a full SSH-CA node (host cert, trust anchors, principals, sshd drop-in, renewal, KRL). |
+
+Both roles target **Ubuntu 22.04 (jammy)** and **Ubuntu 24.04 (noble)** only.
+
+---
 
 ## Installation
 
@@ -28,228 +59,76 @@ Ansible collection for managing X.509 certificates via PKI Manager API.
 ansible-galaxy collection install oriolrius.pki_manager
 ```
 
-### From GitHub
-
-```bash
-ansible-galaxy collection install git+https://github.com/oriolrius/pki-manager-ansible.git,v1.0.0
-```
-
 ### Using requirements.yml
 
 ```yaml
 # requirements.yml
 collections:
   - name: oriolrius.pki_manager
-    version: ">=1.0.0"
+    version: ">=2.3.0"
 ```
 
 ```bash
 ansible-galaxy collection install -r requirements.yml
 ```
 
-## Quick Start
+The `community.crypto >=2.0.0` dependency is resolved automatically from the collection's `galaxy.yml`.
+
+### From GitHub
+
+```bash
+ansible-galaxy collection install git+https://github.com/oriolrius/pki-manager-ansible.git,v2.3.0
+```
+
+---
+
+## Quick start
+
+Two peer workflows — pick your domain.
+
+### X.509 — create a CA and issue a server certificate
 
 ```yaml
-- name: PKI Operations
-  hosts: localhost
-  collections:
-    - oriolrius.pki_manager
+- hosts: localhost
+  gather_facts: false
+  collections: [oriolrius.pki_manager]
   vars:
-    pki_api_url: "https://pki.example.com/api/v1"
-    pki_oidc_url: "https://iam.example.com/realms/pki/protocol/openid-connect/token"
-    pki_client_id: "{{ lookup('env', 'PKI_CLIENT_ID') }}"
-    pki_client_secret: "{{ lookup('env', 'PKI_CLIENT_SECRET') }}"
-
+    api_url: "https://pki.example.com/api/v1"
+    oidc_url: "https://iam.example.com/realms/pki/protocol/openid-connect/token"
+    client_id: "{{ lookup('env', 'PKI_CLIENT_ID') }}"
+    client_secret: "{{ lookup('env', 'PKI_CLIENT_SECRET') }}"
   tasks:
-    - name: Issue a certificate
+    - name: Create a Root CA
+      pki_manager:
+        action: ca_create
+        api_url: "{{ api_url }}"
+        oidc_url: "{{ oidc_url }}"
+        client_id: "{{ client_id }}"
+        client_secret: "{{ client_secret }}"
+        ca_cn: "My Root CA"
+        ca_org: "My Organization"
+        ca_country: "US"
+      register: ca
+
+    - name: Issue a server certificate
       pki_manager:
         action: cert_issue
-        api_url: "{{ pki_api_url }}"
-        oidc_url: "{{ pki_oidc_url }}"
-        client_id: "{{ pki_client_id }}"
-        client_secret: "{{ pki_client_secret }}"
-        ca_id: "your-ca-id"
-        cert_cn: "server.example.com"
+        api_url: "{{ api_url }}"
+        oidc_url: "{{ oidc_url }}"
+        client_id: "{{ client_id }}"
+        client_secret: "{{ client_secret }}"
+        ca_id: "{{ ca.ca_id }}"
+        cert_cn: "webserver.example.com"
+        cert_org: "My Organization"
+        cert_country: "US"
         cert_type: "server"
-        cert_dns_names:
-          - "server.example.com"
-          - "www.example.com"
-      register: cert_result
-
-    - name: Download certificate
-      pki_manager:
-        action: cert_download
-        api_url: "{{ pki_api_url }}"
-        oidc_url: "{{ pki_oidc_url }}"
-        client_id: "{{ pki_client_id }}"
-        client_secret: "{{ pki_client_secret }}"
-        cert_id: "{{ cert_result.cert_id }}"
-        download_format: "p12"
-        download_password: "{{ vault_password }}"
-        download_dest: "/etc/ssl/server.p12"
+        cert_dns_names: ["webserver.example.com", "www.example.com"]
+      register: cert
 ```
 
-Or using fully qualified collection name (FQCN):
+### SSH — deploy a server and onboard a user
 
-```yaml
-- name: Issue a certificate
-  oriolrius.pki_manager.pki_manager:
-    action: cert_issue
-    api_url: "{{ pki_api_url }}"
-    # ... other parameters
-```
-
-## Host Setup Role
-
-The `pki_host_setup` role automates certificate provisioning for Ubuntu hosts. It issues certificates with the hostname as CN, installs them in standard locations, and optionally notifies services to reload.
-
-### Basic Role Usage
-
-```yaml
-- name: Setup host certificates
-  hosts: webservers
-  become: true
-  collections:
-    - oriolrius.pki_manager
-
-  vars:
-    pki_api_url: "https://pki.example.com/api/v1"
-    pki_oidc_url: "https://iam.example.com/realms/pki/protocol/openid-connect/token"
-    pki_client_id: "{{ lookup('env', 'PKI_CLIENT_ID') }}"
-    pki_client_secret: "{{ lookup('env', 'PKI_CLIENT_SECRET') }}"
-    pki_ca_id: "your-ca-id"
-
-    pki_certificates:
-      - name: "nginx"
-        dns_names:
-          - "{{ ansible_fqdn }}"
-          - "web.example.com"
-        notify:
-          - reload nginx
-
-  handlers:
-    - name: reload nginx
-      ansible.builtin.service:
-        name: nginx
-        state: reloaded
-
-  roles:
-    - pki_host_setup
-```
-
-### Multiple Certificates
-
-```yaml
-pki_certificates:
-  # Web server certificate
-  - name: "nginx"
-    type: "server"
-    dns_names:
-      - "web.example.com"
-      - "www.example.com"
-    ip_addresses:
-      - "10.0.0.10"
-    notify:
-      - reload nginx
-
-  # API server certificate
-  - name: "api"
-    type: "server"
-    dns_names:
-      - "api.example.com"
-    notify:
-      - restart api
-
-  # Client certificate for mTLS
-  - name: "mtls-client"
-    type: "client"
-    format: "p12"
-    password: "{{ vault_password }}"
-```
-
-### Certificate Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `name` | hostname | Certificate identifier |
-| `cn` | FQDN | Common Name |
-| `type` | server | server, client, dual, email, code_signing |
-| `dns_names` | [FQDN, hostname] | DNS SAN entries |
-| `ip_addresses` | [default_ipv4] | IP SAN entries |
-| `validity` | 365 | Days |
-| `format` | pem | pem, p12, pfx |
-| `password` | - | Required for p12/pfx |
-| `notify` | [] | Handlers to trigger |
-
-### Installed Files (PEM format)
-
-| File | Location | Permissions |
-|------|----------|-------------|
-| Certificate | `/etc/ssl/certs/<name>.crt` | 0644 root:root |
-| Private Key | `/etc/ssl/private/<name>.key` | 0640 root:ssl-cert |
-| CA Chain | `/etc/ssl/certs/<name>-chain.crt` | 0644 root:root |
-| Full Chain | `/etc/ssl/certs/<name>-fullchain.crt` | 0644 root:root |
-
-See [roles/pki_host_setup/README.md](roles/pki_host_setup/README.md) for complete documentation.
-
-## Available Actions
-
-| Action | Description | Required Parameters |
-|--------|-------------|---------------------|
-| `auth_test` | Test authentication | - |
-| `stats` | Get PKI statistics | - |
-| `expiring` | List expiring certificates | - |
-| `search` | Search CAs and certificates | `search_query` |
-| `ca_create` | Create a CA | `ca_cn`, `ca_org`, `ca_country` |
-| `ca_list` | List CAs | - |
-| `ca_get` | Get CA details | `ca_id` |
-| `ca_revoke` | Revoke a CA | `ca_id` |
-| `ca_delete` | Delete a CA | `ca_id` |
-| `cert_issue` | Issue a certificate | `ca_id`, `cert_cn` |
-| `cert_list` | List certificates | - |
-| `cert_get` | Get certificate details | `cert_id` |
-| `cert_renew` | Renew a certificate | `cert_id` |
-| `cert_revoke` | Revoke a certificate | `cert_id` |
-| `cert_delete` | Delete a certificate | `cert_id` |
-| `cert_download` | Download certificate | `cert_id` |
-
-**SSH workflow actions** (all REST, no tRPC):
-
-| Action | Description | Required Parameters |
-|--------|-------------|---------------------|
-| `ssh_ca_create` | Create an SSH CA (user/host) | `ssh_ca_type` |
-| `ssh_ca_list` | List SSH CAs | - |
-| `ssh_token_mint` | Mint a fleet token | `token_name`, `token_ops` |
-| `ssh_identity_create` | Create a user identity | `identity_subject` |
-| `ssh_principal_create` | Create a principal (role) | `principal_name` |
-| `ssh_principal_grant` | Entitle an identity to a principal | `identity_id`, `principal_id` |
-| `ssh_principal_map` | Map a principal to a host account | `host_id`, `principal_id`, `local_account` |
-| `ssh_user_issue` | Issue a user certificate | `identity_id`, `ssh_public_key`, `principals` |
-| `ssh_host_register` | Register a host by its pubkey | `host_fqdn`, `host_pubkey` |
-| `ssh_host_list` | List/lookup hosts (by `host_fqdn`) | - |
-| `ssh_block` / `ssh_unblock` | Per-host access block | `host_id`, `identity_id` |
-| `ssh_auth_principals` | Render a host's AuthorizedPrincipalsFile | `host_id` |
-| `ssh_sshd_config` | Render a host's authoritative sshd drop-in | `host_id` |
-| `ssh_cert_authority` | Render the client `@cert-authority` trust line | - |
-| `ssh_trusted_user_ca` / `ssh_host_ca` | Fetch the CA trust anchors | - |
-| `ssh_sign_host` | Sign a host cert (host-facing) | `host_fqdn`, `host_pubkey`, `fleet_token` |
-| `ssh_register_host_pubkey` | Register the ECIES key (host-facing) | `host_fqdn`, `fleet_token` |
-| `ssh_get_principals` | Host self-fetch of principals (host-facing) | `host_fqdn`, `fleet_token` |
-
-## SSH Certificate Workflow
-
-Deploy an SSH **server** and onboard a **user** end to end — no `curl`, no tRPC.
-The complete, runnable playbook is
-[`examples/ssh_deploy_server_and_user.yml`](examples/ssh_deploy_server_and_user.yml):
-
-1. **Platform** (localhost): `ssh_ca_create` ×2 → `ssh_token_mint` → `ssh_principal_create`.
-2. **Server** (`sshservers`): apply the **`ssh_host_cert`** role — it generates the host
-   key on the node, signs it (`ssh_sign_host`), installs the User/Host-CA trust anchors,
-   populates `auth_principals`, installs the authoritative sshd drop-in, sets up unattended
-   renewal, and (ECIES) installs the `krl-client` puller.
-3. **User** (localhost): `ssh_identity_create` → `ssh_principal_grant` → `ssh_principal_map`
-   → `ssh_user_issue`, then write the client cert + `~/.ssh/config` + the `@cert-authority`
-   trust line.
+Full runnable playbook: [`examples/ssh_deploy_server_and_user.yml`](examples/ssh_deploy_server_and_user.yml). It creates a User/Host CA, mints a fleet token, defines a `developers` principal, provisions hosts into full SSH-CA nodes via the `ssh_host_cert` role (ECIES channel), then onboards user `alice` (identity → grant → principal→account map → user cert → client `ssh_config`/`known_hosts` with `@cert-authority` trust).
 
 ```yaml
 - hosts: localhost
@@ -271,235 +150,196 @@ The complete, runnable playbook is
         host_ca_id: "{{ host_ca.ca_id }}"
         token_ops: [sign-host, get-principals, register-host-pubkey]
       register: fleet
+    # ...then apply the ssh_host_cert role to your `sshservers` group.
 ```
 
-The `ssh_host_cert` role variables (host key algorithm, KRL channel, renewal cadence,
-`krl-client` source, known_hosts/X.509 toggles) are documented in
-[`roles/ssh_host_cert/README.md`](roles/ssh_host_cert/README.md). A backend running with
-OIDC disabled needs `ALLOW_UNAUTHENTICATED_SSH_CA=true`; the encrypted-KRL channel needs
-`SSH_ECIES_ENABLED=true`.
+---
 
-## Module Parameters
+## Module actions
 
-### Connection Parameters
+The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
+
+### X.509 actions
+
+| Action | Purpose | Key parameters |
+|---|---|---|
+| `auth_test` | Test auth / `GET /health` | — |
+| `stats` | Get PKI dashboard statistics | — |
+| `expiring` | List soon-expiring certificates | `expiring_limit` |
+| `search` | Search CAs and certificates | `search_query`, `search_limit` |
+| `ca_create` | Create a Certificate Authority | `ca_cn`, `ca_org`, `ca_country` |
+| `ca_list` | List Certificate Authorities | — |
+| `ca_get` | Get CA details | `ca_id` |
+| `ca_revoke` | Revoke a CA | `ca_id`, `revocation_reason` |
+| `ca_delete` | Delete a CA | `ca_id` |
+| `cert_issue` | Issue a leaf certificate | `ca_id`, `cert_cn` |
+| `cert_list` | List certificates | — |
+| `cert_get` | Get certificate details | `cert_id` |
+| `cert_renew` | Renew a certificate | `cert_id` |
+| `cert_revoke` | Revoke a certificate | `cert_id`, `revocation_reason` |
+| `cert_delete` | Delete a certificate | `cert_id` |
+| `cert_download` | Download certificate in a format | `cert_id`, `download_format`, `download_password`, `download_dest` |
+
+### SSH actions
+
+| Action | Purpose | Key parameters |
+|---|---|---|
+| `ssh_ca_create` | Create SSH user/host CA | `ssh_ca_type`, `ssh_ca_label` |
+| `ssh_ca_list` | List SSH CAs | — |
+| `ssh_token_mint` | Mint fleet bearer token | `token_name`, `token_ops`, `host_ca_id`/`user_ca_id` |
+| `ssh_identity_create` | Create SSH identity | `identity_subject`, `identity_email` |
+| `ssh_principal_create` | Create SSH principal | `principal_name`, `principal_description` |
+| `ssh_principal_grant` | Grant principal to identity | `identity_id`, `principal_id` |
+| `ssh_principal_map` | Map principal to local account | `host_id`, `principal_id`, `local_account` |
+| `ssh_user_issue` | Issue SSH user certificate | `identity_id`, `ssh_public_key`, `principals`, `user_valid_seconds` |
+| `ssh_host_register` | Register SSH host pubkey | `host_fqdn`, `host_pubkey`, `host_addresses` |
+| `ssh_host_list` | List / resolve SSH hosts | `host_fqdn` |
+| `ssh_block` | Block identity on host | `host_id`, `identity_id`, `block_reason` |
+| `ssh_unblock` | Unblock identity on host | `host_id`, `identity_id` |
+| `ssh_auth_principals` | Render host `auth_principals` file | `host_id` |
+| `ssh_sshd_config` | Render sshd drop-in config | `host_id` |
+| `ssh_cert_authority` | Fetch `@cert-authority` known_hosts line | `cert_authority_pattern` |
+| `ssh_trusted_user_ca` | Fetch `TrustedUserCAKeys` content | — |
+| `ssh_host_ca` | Fetch host-CA trust anchor | — |
+| `ssh_sign_host` | Sign host cert (fleet-token) | `host_fqdn`, `host_pubkey`, `fleet_token`, `user_valid_seconds`, `idempotency_key` |
+| `ssh_register_host_pubkey` | Register ECIES host key (fleet-token) | `host_fqdn`, `fleet_token` |
+| `ssh_get_principals` | Fetch host `auth_principals` (fleet-token) | `host_fqdn`, `fleet_token` |
+
+X.509 and SSH-admin actions hit `{api_url}/…` with the optional OIDC Bearer. Host-facing actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`) hit `/external/ssh` with the `fleet_token` Bearer. `required_if` enforces per-action mandatory parameters (e.g. `ssh_sign_host` requires `host_fqdn` + `host_pubkey` + `fleet_token`).
+
+---
+
+## Key parameters
+
+### Connection / OIDC (OIDC optional)
 
 | Parameter | Required | Default | Description |
-|-----------|----------|---------|-------------|
-| `action` | Yes | - | Action to perform (see table above) |
-| `api_url` | Yes | - | PKI Manager API URL |
-| `oidc_url` | Yes | - | OIDC token endpoint |
-| `client_id` | Yes | - | OIDC client ID |
-| `client_secret` | Yes | - | OIDC client secret |
-| `validate_certs` | No | `true` | Validate SSL certificates |
+|---|---|---|---|
+| `action` | Yes | — | Action to perform (see tables above) |
+| `api_url` | Yes | — | PKI Manager REST base URL |
+| `oidc_url` | No | — | OIDC token endpoint (omit when OIDC is disabled) |
+| `client_id` | No | — | OIDC client ID |
+| `client_secret` | No | — | OIDC client secret (`no_log`) |
+| `validate_certs` | No | `true` | Verify the PKI Manager TLS certificate |
 | `timeout` | No | `30` | Request timeout (seconds) |
-| `token_cache_path` | No | `/tmp/.pki_token_cache` | Token cache file path |
+| `token_cache_path` | No | `/tmp/.pki_token_cache` | OIDC token cache (60 s expiry buffer, `chmod 0600`) |
+| `fleet_token` | No | — | `pkimg_…` bearer (`no_log`) for host-facing SSH actions |
 
-### CA Parameters
+When `oidc_url`/`client_id`/`client_secret` are absent, the module authenticates as unauthenticated — suitable for a backend with `ALLOW_UNAUTHENTICATED_SSH_CA=true`.
 
-| Parameter | Description |
-|-----------|-------------|
-| `ca_id` | CA ID (for operations on existing CA) |
-| `ca_cn` | Common Name |
-| `ca_org` | Organization |
-| `ca_country` | Country (2-letter code) |
-| `ca_ou` | Organizational Unit |
-| `ca_state` | State/Province |
-| `ca_locality` | Locality/City |
-| `ca_algorithm` | Key algorithm: `RSA-2048`, `RSA-4096`, `ECDSA-P256`, `ECDSA-P384` |
-| `ca_validity` | Validity in days (default: 3650) |
+### Per-domain parameters
 
-### Certificate Parameters
+- **X.509 CA** — `ca_id`, `ca_cn`/`ca_org`/`ca_country` (required for `ca_create`), optional `ca_ou`/`ca_state`/`ca_locality`, `ca_algorithm` (`RSA-2048|RSA-4096|ECDSA-P256|ECDSA-P384`, default `RSA-4096`), `ca_validity` (days, default `3650`).
+- **X.509 certificate** — `cert_id`, `cert_cn` (required for `cert_issue`), optional `cert_org`/`cert_country`/`cert_ou`/`cert_state`/`cert_locality`, `cert_type` (default `server`), `cert_algorithm` (default `RSA-2048`), `cert_validity` (days, default `365`), SAN lists `cert_dns_names`/`cert_ip_addresses`/`cert_emails`.
+- **Downloads** — `download_format` (default `pem`): `pem`, `der`, `chain-pem`, `full-pem`, `full-der`, `key-pem`, `key-der`, `csr-pem`, `p12`, `pfx`, `pkcs8-pem`, `pkcs8-der`, `pkcs8-encrypted`, `jks-keystore`, `jks-truststore`. `download_password` is required for `p12`/`pfx`/`jks-keystore`/`jks-truststore`/`pkcs8-encrypted`. `download_dest` is written `chmod 0600`; if omitted, content is returned base64-encoded.
+- **Revocation** — `revocation_reason` (shared by `ca_revoke` and `cert_revoke`): `unspecified` (default), `keyCompromise`, `caCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`, `privilegeWithdrawn`, `aaCompromise`.
+- **Search / dashboards** — `search_query` (required for `search`), `search_limit` (default `10`), `expiring_limit` (default `5`, capped at `20`).
+- **SSH** — `ssh_ca_type` (`user|host`), `ssh_ca_label`; `token_name`, `token_ops` (e.g. `sign-host`/`get-principals`/`register-host-pubkey`), `host_ca_id`/`user_ca_id`; `identity_id`/`identity_subject`/`identity_email`; `principal_id`/`principal_name`/`principal_description`; `host_id`/`host_fqdn`/`host_pubkey`/`host_addresses`/`local_account`; `ssh_public_key`, `principals`, `user_valid_seconds` (sent as the `validForSeconds` API payload field; used by both `ssh_user_issue` and `ssh_sign_host`), `enforce_entitlement`; `cert_authority_pattern` (default `*`), `block_reason`, `idempotency_key` (`Idempotency-Key` header for `ssh_sign_host`).
 
-| Parameter | Description |
-|-----------|-------------|
-| `cert_id` | Certificate ID |
-| `cert_cn` | Common Name |
-| `cert_org` | Organization |
-| `cert_country` | Country (2-letter code) |
-| `cert_type` | Type: `server`, `client`, `dual`, `email`, `code_signing` |
-| `cert_algorithm` | Key algorithm (default: `RSA-2048`) |
-| `cert_validity` | Validity in days (default: 365) |
-| `cert_dns_names` | List of DNS SANs |
-| `cert_ip_addresses` | List of IP SANs |
-| `cert_emails` | List of email SANs |
+---
 
-### Download Parameters
+## Roles
 
-| Parameter | Description |
-|-----------|-------------|
-| `download_format` | Format: `pem`, `der`, `p12`, `pfx`, `jks-keystore`, `jks-truststore`, `full-pem`, `chain-pem`, `key-pem` |
-| `download_password` | Password for encrypted formats (required for p12, pfx, jks-*) |
-| `download_dest` | Destination file path |
+### `pki_host_setup` — X.509 host certificates
 
-### Other Parameters
+Provisions Ubuntu hosts with X.509 certificates issued from the PKI Manager REST API. In one run it authenticates via OIDC client credentials, issues one or more certs from a chosen CA (CN auto-derived from the hostname/FQDN, configurable DNS+IP SANs, per-cert type/validity/format), installs them to standard Ubuntu locations with correct permissions (certs `0644 root:root`, keys `0640 root:ssl-cert`), optionally installs the CA into the system trust store, supports PEM and PKCS12/PFX output, and fires handler notifications (e.g. reload nginx) on change. Exports `pki_issued_certificates` with per-cert id/CN/paths.
 
-| Parameter | Description |
-|-----------|-------------|
-| `revocation_reason` | Revocation reason: `unspecified`, `keyCompromise`, `superseded`, etc. |
-| `search_query` | Search query string |
-| `search_limit` | Max search results (default: 10) |
-| `expiring_limit` | Max expiring certs (default: 5, max: 20) |
+| Variable | Default | Notes |
+|---|---|---|
+| `pki_api_url` | `""` | **Required** — REST base, e.g. `https://pki.example.com/api/v1` |
+| `pki_oidc_url` | `""` | **Required** — OIDC token endpoint |
+| `pki_client_id` / `pki_client_secret` | `""` | **Required** — OIDC credentials |
+| `pki_ca_id` | `""` | **Required** — issuing CA id |
+| `pki_certificates` | `[]` | Certs to issue/install (`name`, `cn`, `type`, `dns_names`, `ip_addresses`, `validity`, `format`, `password`, `*_filename`, `owner`, `group`, `key_group`, `notify`) |
+| `pki_cert_org` / `pki_cert_country` | `""` | Subject O and C (2-letter); required by API |
+| `pki_validate_certs` | `true` | Verify PKI Manager TLS cert |
+| `pki_install_ca_trust` | `true` | Install CA into `/usr/local/share/ca-certificates` |
+| `pki_cert_dir` / `pki_key_dir` / `pki_ca_trust_dir` | `/etc/ssl/certs` / `/etc/ssl/private` / `/usr/local/share/ca-certificates` | Install locations |
+| `pki_cert_validity` / `pki_cert_algorithm` | `365` / `RSA-2048` | Default lifetime / key algorithm |
 
-## Return Values
+Full docs: [`roles/pki_host_setup/README.md`](roles/pki_host_setup/README.md).
 
-| Key | Actions | Description |
-|-----|---------|-------------|
-| `ca` | ca_create, ca_get | CA details |
-| `ca_id` | ca_create | Created CA ID |
-| `cas` | ca_list | List of CAs |
-| `ca_count` | ca_list | Total CA count |
-| `certificate` | cert_issue, cert_get, cert_renew | Certificate details |
-| `cert_id` | cert_issue | Issued certificate ID |
-| `new_cert_id` | cert_renew | Renewed certificate ID |
-| `certificates` | cert_list | List of certificates |
-| `cert_count` | cert_list | Total certificate count |
-| `stats` | stats | PKI statistics |
-| `search_results` | search | Search results (cas, certificates, domains) |
-| `total_count` | search | Total search results |
-| `expiring` | expiring | List of expiring certificates |
-| `downloaded_file` | cert_download | Downloaded file path |
-| `msg` | all | Status message |
-| `changed` | all | Whether changes were made |
+### `ssh_host_cert` — full SSH-CA node
+
+Provisions a full SSH-CA node from the PKI Manager external REST API in a single run. The host key is generated **on** the node (the private key never leaves it); only the public key is signed via `POST /api/v1/external/ssh/sign-host` using a fleet bearer token. One run generates the host key, signs and installs the cert, installs the User-CA and Host-CA trust anchors, populates `/etc/ssh/auth_principals/<account>` for login RBAC plus a fail-closed `RevokedKeys` placeholder, installs the authoritative algorithm-aware sshd drop-in (`60-ssh-ca.conf`), runs `sshd -t` and reloads, installs unattended host-cert renewal, and — on the ECIES path — registers the ecdsa key and installs the `krl-client` puller. All API calls go through the `pki_manager` module (REST only).
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ssh_ca_base_url` | `https://pki.internal` | PKI Manager base URL |
+| `ssh_ca_fleet_token` | `""` | **Must be vaulted** — `pkimg_…` token scoped to one Host CA (ops `sign-host`, `get-principals`, and ECIES `register-host-pubkey`) |
+| `ssh_host_cert_ecies_enabled` | `false` | Master switch for the encrypted-KRL path (forces an `ecdsa-sha2-nistp256` host key) |
+| `ssh_host_cert_key_type` | `ecdsa` if ECIES else `ed25519` | Host key algorithm (ECIES is P-256-only) |
+| `ssh_host_cert_renew_enabled` | `true` | Unattended renewal (stores the fleet token `0600` on the host) |
+| `ssh_host_cert_scheduler` | `cron` (alt `systemd`) | Substrate for renewal + krl-client |
+| `ssh_host_cert_reload_method` | `service` (alt `command` = SIGHUP) | How sshd reload runs |
+| `ssh_host_cert_principals_enabled` / `_prune` | `true` / `false` | Populate / prune `AuthorizedPrincipalsFile` |
+| `ssh_host_cert_krl_client_url` / `_checksum` | `""` / `""` | krl-client binary source + `sha256:…` guard |
+| `ssh_host_cert_krl_cron_enabled` | `false` | Public-path KRL refresh cron (non-ECIES hosts) |
+| `ssh_host_cert_known_hosts_enabled` | `false` | Install `@cert-authority` client-trust line |
+| `ssh_host_cert_x509_ca_trust_enabled` / `_x509_crl_cron_enabled` | `false` | Optional non-SSH X.509 CA-trust + CRL refresh |
+| `ssh_host_cert_renew_bucket_format` | `%G-%V` | ISO year-week (re-mints a fresh 52-week cert weekly) |
+| `ssh_host_cert_renew_cron` / `_renew_oncalendar` | `17 3 * * *` / `*-*-* 03:17:00` | Renewal schedule (cron / systemd) |
+| `ssh_host_cert_krl_client_interval_minutes` | `15` | krl-client poll interval |
+| `ssh_host_cert_require_timesync` | `true` | NTP/chrony is a hard prereq (krl-client exits 5 on clock drift) |
+
+Full docs: [`roles/ssh_host_cert/README.md`](roles/ssh_host_cert/README.md).
+
+---
 
 ## Examples
 
-### Create CA and Issue Certificate
+| File | What it shows |
+|---|---|
+| [`examples/webserver_setup.yml`](examples/webserver_setup.yml) | `pki_host_setup` provisioning multiple TLS server certs (nginx-main, nginx-api) with DNS/IP SANs, reload-nginx handlers, and SSL config rendered from the issued paths. |
+| [`examples/ssh_deploy_server_and_user.yml`](examples/ssh_deploy_server_and_user.yml) | End-to-end SSH workflow (no `curl`): dual User/Host CA, fleet-token mint, `developers` principal, `ssh_host_cert` role over ECIES, then onboarding user `alice` (identity, grant, principal→account map, user cert, client `ssh_config`/`known_hosts` with `@cert-authority` trust). |
 
-```yaml
-- name: Create Root CA
-  oriolrius.pki_manager.pki_manager:
-    action: ca_create
-    api_url: "{{ api_url }}"
-    oidc_url: "{{ oidc_url }}"
-    client_id: "{{ client_id }}"
-    client_secret: "{{ client_secret }}"
-    ca_cn: "My Root CA"
-    ca_org: "My Organization"
-    ca_country: "US"
-    ca_validity: 3650
-  register: ca
-
-- name: Issue Server Certificate
-  oriolrius.pki_manager.pki_manager:
-    action: cert_issue
-    api_url: "{{ api_url }}"
-    oidc_url: "{{ oidc_url }}"
-    client_id: "{{ client_id }}"
-    client_secret: "{{ client_secret }}"
-    ca_id: "{{ ca.ca_id }}"
-    cert_cn: "webserver.example.com"
-    cert_org: "My Organization"
-    cert_country: "US"
-    cert_type: "server"
-    cert_dns_names:
-      - "webserver.example.com"
-      - "www.example.com"
-    cert_ip_addresses:
-      - "192.168.1.100"
-  register: cert
-```
-
-### Download in Multiple Formats
-
-```yaml
-- name: Download as PEM (certificate + chain)
-  oriolrius.pki_manager.pki_manager:
-    action: cert_download
-    api_url: "{{ api_url }}"
-    oidc_url: "{{ oidc_url }}"
-    client_id: "{{ client_id }}"
-    client_secret: "{{ client_secret }}"
-    cert_id: "{{ cert.cert_id }}"
-    download_format: "full-pem"
-    download_dest: "/etc/ssl/certs/server.pem"
-
-- name: Download as PKCS12
-  oriolrius.pki_manager.pki_manager:
-    action: cert_download
-    api_url: "{{ api_url }}"
-    oidc_url: "{{ oidc_url }}"
-    client_id: "{{ client_id }}"
-    client_secret: "{{ client_secret }}"
-    cert_id: "{{ cert.cert_id }}"
-    download_format: "p12"
-    download_password: "{{ vault_p12_password }}"
-    download_dest: "/etc/ssl/private/server.p12"
-```
-
-### Monitor Expiring Certificates
-
-```yaml
-- name: Get expiring certificates
-  oriolrius.pki_manager.pki_manager:
-    action: expiring
-    api_url: "{{ api_url }}"
-    oidc_url: "{{ oidc_url }}"
-    client_id: "{{ client_id }}"
-    client_secret: "{{ client_secret }}"
-    expiring_limit: 20
-  register: expiring
-
-- name: Alert on certificates expiring soon
-  ansible.builtin.debug:
-    msg: "WARNING: {{ item.cn }} expires in {{ item.daysRemaining }} days!"
-  loop: "{{ expiring.expiring }}"
-  when: item.daysRemaining | int < 30
-```
-
-### Renew and Revoke
-
-```yaml
-- name: Renew certificate
-  oriolrius.pki_manager.pki_manager:
-    action: cert_renew
-    api_url: "{{ api_url }}"
-    oidc_url: "{{ oidc_url }}"
-    client_id: "{{ client_id }}"
-    client_secret: "{{ client_secret }}"
-    cert_id: "{{ old_cert_id }}"
-    cert_validity: 365
-  register: renewed
-
-- name: Revoke old certificate
-  oriolrius.pki_manager.pki_manager:
-    action: cert_revoke
-    api_url: "{{ api_url }}"
-    oidc_url: "{{ oidc_url }}"
-    client_id: "{{ client_id }}"
-    client_secret: "{{ client_secret }}"
-    cert_id: "{{ old_cert_id }}"
-    revocation_reason: "superseded"
-```
-
-## Testing
+## Tests
 
 ```bash
-# Set credentials
 export PKI_API_URL="https://pki.example.com/api/v1"
 export PKI_OIDC_URL="https://iam.example.com/realms/pki/protocol/openid-connect/token"
 export PKI_CLIENT_ID="your-client-id"
 export PKI_CLIENT_SECRET="your-client-secret"
 
-# Build and install collection locally
 ansible-galaxy collection build
 ansible-galaxy collection install oriolrius-pki_manager-*.tar.gz --force
 
-# Run tests
-ansible-playbook tests/test_module.yml
+ansible-playbook tests/test_module.yml       # X.509 CRUD/lifecycle smoke test
+ansible-playbook tests/test_ssh_module.yml   # every SSH action (unauthenticated + ECIES)
+ansible-playbook tests/test_role.yml         # pki_host_setup integration
+ansible-playbook tests/test_role_syntax.yml  # offline --check structural validation
 ```
 
-## License
+---
 
-MIT
+## Supported platforms
 
-## Author
+Both roles target **Ubuntu only**: Ubuntu 22.04 (jammy) and Ubuntu 24.04 (noble). Minimum Ansible `2.14`.
 
-Oriol Rius - [joor.net](https://joor.net)
+---
 
-## Related Projects
+## Authentication
+
+The collection supports three modes:
+
+- **OIDC (optional)** — set `oidc_url` + `client_id` + `client_secret` for client-credentials auth; tokens are cached at `token_cache_path` (`0600`, 60 s buffer).
+- **Unauthenticated** — omit OIDC entirely against a backend started with `ALLOW_UNAUTHENTICATED_SSH_CA=true`.
+- **Fleet token** — host-facing SSH actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`) use a `pkimg_…` `fleet_token` bearer against `/external/ssh`.
+
+**Backend prerequisites for SSH:** `SSH_ECIES_ENABLED=true` (encrypted-KRL channel), `ALLOW_UNAUTHENTICATED_SSH_CA=true` (when OIDC is off), `SSH_HOST_KRL_PUBLIC=true` (per-host public KRL blocks), and NTP/chrony on every host.
+
+---
+
+## Related projects
 
 | Project | Description |
-|---------|-------------|
+|---|---|
 | [PKI Manager](https://github.com/oriolrius/pki-manager-web) | Main PKI Manager web application |
 | [PKI Manager CLI](https://github.com/oriolrius/pki-manager-cli) | Python CLI tool for PKI Manager |
 | [PKI Manager Skill](https://github.com/oriolrius/pki-manager-skill) | Claude Code skill for AI-assisted certificate management |
+
+---
+
+## License
+
+MIT — Oriol Rius <oriol@joor.net> ([joor.net](https://joor.net)).
