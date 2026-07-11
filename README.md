@@ -4,9 +4,10 @@ Ansible collection for managing X.509 certificates via PKI Manager API.
 
 ## Features
 
-- **Module (`pki_manager`)**: Full API access for CA and certificate operations
-- **Role (`pki_host_setup`)**: Automated host certificate provisioning for Ubuntu
-- OIDC authentication with automatic token caching
+- **Module (`pki_manager`)**: Full REST API access for X.509 **and** the SSH certificate workflow
+- **Role (`pki_host_setup`)**: Automated X.509 host certificate provisioning for Ubuntu
+- **Role (`ssh_host_cert`)**: Provision a full SSH-CA node (host cert, trust anchors, login-RBAC principals, authoritative sshd drop-in, unattended renewal, encrypted-KRL revocation) — see [SSH Certificate Workflow](#ssh-certificate-workflow)
+- OIDC authentication with automatic token caching (optional — omit for a backend with OIDC disabled)
 - CA management (create, list, get, revoke, delete)
 - Certificate management (issue, list, get, renew, revoke, delete)
 - Certificate download in multiple formats (PEM, DER, P12, JKS, etc.)
@@ -211,6 +212,72 @@ See [roles/pki_host_setup/README.md](roles/pki_host_setup/README.md) for complet
 | `cert_revoke` | Revoke a certificate | `cert_id` |
 | `cert_delete` | Delete a certificate | `cert_id` |
 | `cert_download` | Download certificate | `cert_id` |
+
+**SSH workflow actions** (all REST, no tRPC):
+
+| Action | Description | Required Parameters |
+|--------|-------------|---------------------|
+| `ssh_ca_create` | Create an SSH CA (user/host) | `ssh_ca_type` |
+| `ssh_ca_list` | List SSH CAs | - |
+| `ssh_token_mint` | Mint a fleet token | `token_name`, `token_ops` |
+| `ssh_identity_create` | Create a user identity | `identity_subject` |
+| `ssh_principal_create` | Create a principal (role) | `principal_name` |
+| `ssh_principal_grant` | Entitle an identity to a principal | `identity_id`, `principal_id` |
+| `ssh_principal_map` | Map a principal to a host account | `host_id`, `principal_id`, `local_account` |
+| `ssh_user_issue` | Issue a user certificate | `identity_id`, `ssh_public_key`, `principals` |
+| `ssh_host_register` | Register a host by its pubkey | `host_fqdn`, `host_pubkey` |
+| `ssh_host_list` | List/lookup hosts (by `host_fqdn`) | - |
+| `ssh_block` / `ssh_unblock` | Per-host access block | `host_id`, `identity_id` |
+| `ssh_auth_principals` | Render a host's AuthorizedPrincipalsFile | `host_id` |
+| `ssh_sshd_config` | Render a host's authoritative sshd drop-in | `host_id` |
+| `ssh_cert_authority` | Render the client `@cert-authority` trust line | - |
+| `ssh_trusted_user_ca` / `ssh_host_ca` | Fetch the CA trust anchors | - |
+| `ssh_sign_host` | Sign a host cert (host-facing) | `host_fqdn`, `host_pubkey`, `fleet_token` |
+| `ssh_register_host_pubkey` | Register the ECIES key (host-facing) | `host_fqdn`, `fleet_token` |
+| `ssh_get_principals` | Host self-fetch of principals (host-facing) | `host_fqdn`, `fleet_token` |
+
+## SSH Certificate Workflow
+
+Deploy an SSH **server** and onboard a **user** end to end — no `curl`, no tRPC.
+The complete, runnable playbook is
+[`examples/ssh_deploy_server_and_user.yml`](examples/ssh_deploy_server_and_user.yml):
+
+1. **Platform** (localhost): `ssh_ca_create` ×2 → `ssh_token_mint` → `ssh_principal_create`.
+2. **Server** (`sshservers`): apply the **`ssh_host_cert`** role — it generates the host
+   key on the node, signs it (`ssh_sign_host`), installs the User/Host-CA trust anchors,
+   populates `auth_principals`, installs the authoritative sshd drop-in, sets up unattended
+   renewal, and (ECIES) installs the `krl-client` puller.
+3. **User** (localhost): `ssh_identity_create` → `ssh_principal_grant` → `ssh_principal_map`
+   → `ssh_user_issue`, then write the client cert + `~/.ssh/config` + the `@cert-authority`
+   trust line.
+
+```yaml
+- hosts: localhost
+  gather_facts: false
+  collections: [oriolrius.pki_manager]
+  tasks:
+    - name: Create the Host CA
+      pki_manager:
+        action: ssh_ca_create
+        api_url: "https://pki.example.com/api/v1"
+        ssh_ca_type: host
+      register: host_ca
+
+    - name: Mint a fleet token for the servers
+      pki_manager:
+        action: ssh_token_mint
+        api_url: "https://pki.example.com/api/v1"
+        token_name: acme-fleet
+        host_ca_id: "{{ host_ca.ca_id }}"
+        token_ops: [sign-host, get-principals, register-host-pubkey]
+      register: fleet
+```
+
+The `ssh_host_cert` role variables (host key algorithm, KRL channel, renewal cadence,
+`krl-client` source, known_hosts/X.509 toggles) are documented in
+[`roles/ssh_host_cert/README.md`](roles/ssh_host_cert/README.md). A backend running with
+OIDC disabled needs `ALLOW_UNAUTHENTICATED_SSH_CA=true`; the encrypted-KRL channel needs
+`SSH_ECIES_ENABLED=true`.
 
 ## Module Parameters
 

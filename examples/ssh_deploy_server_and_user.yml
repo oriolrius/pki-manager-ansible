@@ -1,0 +1,172 @@
+---
+# Complete SSH workflow: deploy a SERVER and onboard a USER — end to end,
+# entirely through the oriolrius.pki_manager collection (REST API, no curl).
+#
+# Scenario: onboard user "alice" (principal `developers` -> local account
+# `deploy`) onto the `sshservers` group, under a fleet CA named "acme", using
+# the encrypted ECIES revocation channel.
+#
+# Usage:
+#   ansible-galaxy collection install oriolrius.pki_manager
+#   ansible-playbook examples/ssh_deploy_server_and_user.yml -i inventory.yml \
+#     -e pki_base_url=https://pki.example.com
+#
+# inventory.yml (YAML, not INI):
+#   all:
+#     children:
+#       sshservers:
+#         hosts:
+#           server1.acme.example: {}
+#
+# The backend needs SSH_ECIES_ENABLED=true. With OIDC enabled, also pass
+# pki_oidc_url / pki_client_id / pki_client_secret (see module_defaults below);
+# with OIDC off it must run with ALLOW_UNAUTHENTICATED_SSH_CA=true.
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "1. Platform + fleet: create the dual CA, mint the fleet token, principal"
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    oriolrius.pki_manager.pki_manager:
+      api_url: "{{ pki_base_url }}/api/v1"
+      validate_certs: "{{ pki_validate_certs | default(true) }}"
+      # For an OIDC-protected backend, uncomment and vault these:
+      # oidc_url: "{{ pki_oidc_url }}"
+      # client_id: "{{ pki_client_id }}"
+      # client_secret: "{{ pki_client_secret }}"
+  tasks:
+    - name: Create the User CA and the Host CA
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_ca_create
+        ssh_ca_type: "{{ item }}"
+        ssh_ca_label: "acme-{{ item }}"
+      loop: [user, host]
+      register: _cas
+
+    - name: Mint the fleet token (sign-host + get-principals + register-host-pubkey)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_token_mint
+        token_name: acme-fleet
+        host_ca_id: "{{ _cas.results[1].ca_id }}"
+        token_ops: [sign-host, get-principals, register-host-pubkey]
+      register: _token
+      no_log: true
+
+    - name: Create the 'developers' principal (role label)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_create
+        principal_name: developers
+        principal_description: "app deployers"
+      register: _principal
+
+    - name: Publish platform facts for the later plays
+      ansible.builtin.set_fact:
+        acme_user_ca: "{{ _cas.results[0].ca_id }}"
+        acme_host_ca: "{{ _cas.results[1].ca_id }}"
+        acme_fleet_token: "{{ _token.token }}"
+        acme_principal_id: "{{ _principal.principal_id }}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "2. Server: provision every host into a full SSH-CA node (ECIES channel)"
+  hosts: sshservers
+  become: true
+  gather_facts: true   # the role needs ansible_fqdn + ansible_all_ipv4_addresses
+  vars:
+    ssh_ca_base_url: "{{ pki_base_url }}"
+    ssh_ca_fleet_token: "{{ hostvars['localhost'].acme_fleet_token }}"
+    ssh_host_cert_validate_certs: "{{ pki_validate_certs | default(true) }}"
+    ssh_host_cert_ecies_enabled: true
+    ssh_host_cert_krl_client_url: "https://artifacts.example.com/krl-client-linux-amd64"
+    ssh_host_cert_krl_client_checksum: "sha256:REPLACE_ME"
+  roles:
+    - oriolrius.pki_manager.ssh_host_cert
+
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "3. User: onboard alice (identity -> map -> issue cert -> client config)"
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    oriolrius.pki_manager.pki_manager:
+      api_url: "{{ pki_base_url }}/api/v1"
+      validate_certs: "{{ pki_validate_certs | default(true) }}"
+  vars:
+    user_subject: "alice@acme.example"
+    demo_key: "/tmp/acme-alice/id_ed25519"
+  tasks:
+    - name: Create alice's identity + entitle her to 'developers'
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_identity_create
+        identity_subject: "{{ user_subject }}"
+      register: _ident
+    - name: Grant alice the entitlement to encode 'developers'
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_grant
+        identity_id: "{{ _ident.identity_id }}"
+        principal_id: "{{ hostvars['localhost'].acme_principal_id }}"
+
+    - name: Map 'developers' -> account 'deploy' on every provisioned host
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_host_list
+        host_fqdn: "{{ hostvars[item].ansible_fqdn }}"
+      loop: "{{ groups['sshservers'] }}"
+      register: _hosts
+    - name: Map the principal to the 'deploy' account on each host
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_map
+        host_id: "{{ item.host_id }}"
+        principal_id: "{{ hostvars['localhost'].acme_principal_id }}"
+        local_account: deploy
+      loop: "{{ _hosts.results }}"
+      loop_control:
+        label: "{{ item.host_id }}"
+
+    - name: "Re-push principals to the hosts (auth_principals is written at role run time)"
+      ansible.builtin.debug:
+        msg: "Re-run play 2 (the ssh_host_cert role) now so the new maps land in /etc/ssh/auth_principals."
+
+    - name: Generate alice's demo keypair (in production the USER does this)
+      community.crypto.openssh_keypair:
+        path: "{{ demo_key }}"
+        type: ed25519
+      register: _uk
+
+    - name: Issue alice's user certificate with the 'developers' principal
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_user_issue
+        identity_id: "{{ _ident.identity_id }}"
+        user_ca_id: "{{ hostvars['localhost'].acme_user_ca }}"
+        ssh_public_key: "{{ _uk.public_key }}"
+        principals: [developers]
+      register: _usercert
+
+    - name: Install alice's certificate next to her key
+      ansible.builtin.copy:
+        content: "{{ _usercert.cert_openssh }}\n"
+        dest: "{{ demo_key }}-cert.pub"
+        mode: "0644"
+    - name: Fetch the client @cert-authority trust line (kills TOFU)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_cert_authority
+        cert_authority_pattern: "*.acme.example"
+      register: _ca
+    - name: Write a ready-to-use client config + known_hosts
+      ansible.builtin.copy:
+        dest: "{{ item.dest }}"
+        content: "{{ item.content }}"
+        mode: "0644"
+      loop:
+        - dest: "{{ demo_key | dirname }}/known_hosts"
+          content: "{{ _ca.cert_authority }}\n"
+        - dest: "{{ demo_key | dirname }}/ssh_config"
+          content: |
+            Host *.acme.example
+              IdentityFile {{ demo_key }}
+              CertificateFile {{ demo_key }}-cert.pub
+              IdentitiesOnly yes
+              UserKnownHostsFile {{ demo_key | dirname }}/known_hosts
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: How to log in
+      ansible.builtin.debug:
+        msg: "ssh -F {{ demo_key | dirname }}/ssh_config deploy@<a-provisioned-host>"

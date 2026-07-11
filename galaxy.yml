@@ -1,16 +1,19 @@
 ---
 namespace: oriolrius
 name: pki_manager
-version: 2.2.0
+version: 2.3.0
 readme: README.md
 authors:
   - Oriol Rius <oriol@joor.net>
-description: Ansible collection for managing X.509 certificates via PKI Manager API (module + host setup role)
+description: Ansible collection for managing X.509 certificates and the SSH certificate workflow via the PKI Manager REST API (module + host setup roles)
+dependencies:
+  community.crypto: ">=2.0.0"
 license_file: LICENSE
 tags:
   - pki
   - certificates
   - x509
+  - ssh
   - ssl
   - tls
   - security

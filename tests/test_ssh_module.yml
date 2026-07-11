@@ -1,0 +1,192 @@
+---
+# Exercises every SSH action of the pki_manager module against a live backend.
+# Run:  ansible-playbook tests/test_ssh_module.yml -e api_url=http://HOST:PORT/api/v1
+#
+# Requires a backend with SSH_ECIES_ENABLED=true and (OIDC off) with
+# ALLOW_UNAUTHENTICATED_SSH_CA=true. No OIDC credentials are passed here.
+- name: SSH workflow module smoke test
+  hosts: localhost
+  gather_facts: false
+  vars:
+    fqdn: "tmod.ssh.example"
+  module_defaults:
+    oriolrius.pki_manager.pki_manager:
+      api_url: "{{ api_url }}"
+      validate_certs: false
+  tasks:
+    - name: Generate an ecdsa host key (ECIES-eligible) and an ed25519 user key
+      ansible.builtin.command: "ssh-keygen -q -t {{ item.t }} {{ item.extra }} -N '' -f {{ item.f }}"
+      args:
+        creates: "{{ item.f }}"
+      loop:
+        - { t: ecdsa, extra: "-b 256", f: /tmp/tmod_host }
+        - { t: ed25519, extra: "", f: /tmp/tmod_user }
+
+    - name: Read the public keys
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      register: _pubs
+      loop:
+        - /tmp/tmod_host.pub
+        - /tmp/tmod_user.pub
+
+    - name: Set public-key facts
+      ansible.builtin.set_fact:
+        host_pub: "{{ _pubs.results[0].content | b64decode | trim }}"
+        user_pub: "{{ _pubs.results[1].content | b64decode | trim }}"
+
+    - name: Create the dual CA
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_ca_create
+        ssh_ca_type: "{{ item }}"
+        ssh_ca_label: "tmod-{{ item }}"
+      loop: [user, host]
+      register: _cas
+
+    - name: Record the CA ids
+      ansible.builtin.set_fact:
+        user_ca: "{{ _cas.results[0].ca_id }}"
+        host_ca: "{{ _cas.results[1].ca_id }}"
+
+    - name: Mint a fleet token (REST, not tRPC)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_token_mint
+        token_name: tmod-fleet
+        host_ca_id: "{{ host_ca }}"
+        token_ops: [sign-host, get-principals, register-host-pubkey]
+      register: _tok
+
+    - name: Assert the token looks minted
+      ansible.builtin.assert:
+        that: "_tok.token.startswith('pkimg_')"
+
+    - name: Create the identity
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_identity_create
+        identity_subject: "alice@{{ fqdn }}"
+      register: _ident
+
+    - name: Create the principal
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_create
+        principal_name: developers
+      register: _princ
+
+    - name: Grant the entitlement
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_grant
+        identity_id: "{{ _ident.identity_id }}"
+        principal_id: "{{ _princ.principal_id }}"
+
+    - name: Sign the host cert (host-facing, fleet token) — registers the host
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_sign_host
+        host_fqdn: "{{ fqdn }}"
+        host_pubkey: "{{ host_pub }}"
+        fleet_token: "{{ _tok.token }}"
+        idempotency_key: "tmod-{{ fqdn }}"
+      register: _signed
+
+    - name: Assert an ecdsa host cert was signed
+      ansible.builtin.assert:
+        that:
+          - "_signed.cert_openssh is search('ecdsa-sha2-nistp256-cert')"
+          - "_signed.host_id | length > 0"
+
+    - name: Resolve the host id by fqdn (REST list)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_host_list
+        host_fqdn: "{{ fqdn }}"
+      register: _hl
+
+    - name: Assert the resolved id matches
+      ansible.builtin.assert:
+        that: "_hl.host_id == _signed.host_id"
+
+    - name: Map the principal to the deploy account
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_map
+        host_id: "{{ _signed.host_id }}"
+        principal_id: "{{ _princ.principal_id }}"
+        local_account: deploy
+
+    - name: Render auth_principals (admin)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_auth_principals
+        host_id: "{{ _signed.host_id }}"
+      register: _ap
+
+    - name: Assert the dual-form render
+      ansible.builtin.assert:
+        that: "_ap.auth_principals.files.deploy == 'developers\ndevelopers@' + fqdn + '\n'"
+
+    - name: Host self-fetch of its principals (host-facing, fleet token)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_get_principals
+        host_fqdn: "{{ fqdn }}"
+        fleet_token: "{{ _tok.token }}"
+      register: _gp
+
+    - name: Assert host render matches admin render
+      ansible.builtin.assert:
+        that: "_gp.auth_principals.files.deploy == _ap.auth_principals.files.deploy"
+
+    - name: Render the authoritative sshd drop-in
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_sshd_config
+        host_id: "{{ _signed.host_id }}"
+      register: _dropin
+
+    - name: Assert the drop-in is algorithm-aware (ecdsa host)
+      ansible.builtin.assert:
+        that: "'ssh_host_ecdsa_key' in _dropin.sshd_config"
+
+    - name: Register the ECIES key (host-facing) — 200 not 501/409
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_register_host_pubkey
+        host_fqdn: "{{ fqdn }}"
+        fleet_token: "{{ _tok.token }}"
+
+    - name: Issue a user certificate
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_user_issue
+        identity_id: "{{ _ident.identity_id }}"
+        user_ca_id: "{{ user_ca }}"
+        ssh_public_key: "{{ user_pub }}"
+        principals: [developers]
+      register: _uc
+
+    - name: Assert a user cert was issued
+      ansible.builtin.assert:
+        that: "_uc.cert_openssh is search('ssh-ed25519-cert')"
+
+    - name: Fetch the client @cert-authority trust line
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_cert_authority
+        cert_authority_pattern: "*.{{ fqdn }}"
+      register: _ca
+
+    - name: Assert the @cert-authority line
+      ansible.builtin.assert:
+        that: "_ca.cert_authority.startswith('@cert-authority')"
+
+    - name: Fetch the trust anchors
+      oriolrius.pki_manager.pki_manager:
+        action: "{{ item }}"
+      loop: [ssh_trusted_user_ca, ssh_host_ca]
+
+    - name: Block the identity on the host
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_block
+        host_id: "{{ _signed.host_id }}"
+        identity_id: "{{ _ident.identity_id }}"
+
+    - name: Unblock the identity on the host
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_unblock
+        host_id: "{{ _signed.host_id }}"
+        identity_id: "{{ _ident.identity_id }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "ALL SSH MODULE ACTIONS PASSED against {{ api_url }}"

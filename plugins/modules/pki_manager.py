@@ -39,6 +39,26 @@ options:
             - cert_revoke
             - cert_delete
             - cert_download
+            - ssh_ca_create
+            - ssh_ca_list
+            - ssh_token_mint
+            - ssh_identity_create
+            - ssh_principal_create
+            - ssh_principal_grant
+            - ssh_principal_map
+            - ssh_user_issue
+            - ssh_host_register
+            - ssh_host_list
+            - ssh_block
+            - ssh_unblock
+            - ssh_auth_principals
+            - ssh_sshd_config
+            - ssh_cert_authority
+            - ssh_trusted_user_ca
+            - ssh_host_ca
+            - ssh_sign_host
+            - ssh_register_host_pubkey
+            - ssh_get_principals
     api_url:
         description:
             - PKI Manager API URL.
@@ -234,6 +254,88 @@ options:
             - Path to cache OIDC tokens.
         type: path
         default: '/tmp/.pki_token_cache'
+    fleet_token:
+        description:
+            - Fleet bearer token (pkimg_...) for the host-facing external SSH API
+              (ssh_sign_host, ssh_register_host_pubkey, ssh_get_principals).
+        type: str
+    ssh_ca_type:
+        description: SSH CA type for ssh_ca_create.
+        type: str
+        choices: ['user', 'host']
+    ssh_ca_label:
+        description: Optional label for ssh_ca_create.
+        type: str
+    token_name:
+        description: Name of the fleet token (ssh_token_mint).
+        type: str
+    token_ops:
+        description: Op-set for the fleet token (ssh_token_mint), e.g. sign-host, get-principals, register-host-pubkey.
+        type: list
+        elements: str
+    host_ca_id:
+        description: Host CA id (ssh_token_mint).
+        type: str
+    user_ca_id:
+        description: User CA id (ssh_token_mint, ssh_user_issue).
+        type: str
+    identity_id:
+        description: SSH identity id.
+        type: str
+    identity_subject:
+        description: Subject for ssh_identity_create.
+        type: str
+    identity_email:
+        description: Optional email for ssh_identity_create.
+        type: str
+    principal_id:
+        description: Principal id (ssh_principal_grant, ssh_principal_map).
+        type: str
+    principal_name:
+        description: Principal name for ssh_principal_create.
+        type: str
+    principal_description:
+        description: Optional description for ssh_principal_create.
+        type: str
+    host_id:
+        description: Server-side host id (ssh_principal_map, ssh_block, ssh_auth_principals, ssh_sshd_config).
+        type: str
+    host_fqdn:
+        description: Host FQDN (ssh_host_register/list, ssh_sign_host, ssh_register_host_pubkey, ssh_get_principals).
+        type: str
+    host_pubkey:
+        description: Host OpenSSH public key (ssh_host_register, ssh_sign_host).
+        type: str
+    host_addresses:
+        description: Host IP addresses (ssh_host_register, ssh_sign_host).
+        type: list
+        elements: str
+    local_account:
+        description: Local UNIX account for ssh_principal_map.
+        type: str
+    ssh_public_key:
+        description: User OpenSSH public key for ssh_user_issue.
+        type: str
+    principals:
+        description: Principals to encode in the user certificate (ssh_user_issue).
+        type: list
+        elements: str
+    user_valid_seconds:
+        description: Validity in seconds for the user cert / signed host cert.
+        type: int
+    enforce_entitlement:
+        description: Constrain issued principals to the identity's catalog entitlements (ssh_user_issue).
+        type: bool
+    cert_authority_pattern:
+        description: known_hosts pattern for ssh_cert_authority.
+        type: str
+        default: '*'
+    block_reason:
+        description: Optional reason for ssh_block.
+        type: str
+    idempotency_key:
+        description: Idempotency-Key header for ssh_sign_host.
+        type: str
 author:
     - Oriol Rius (@oriolrius)
 '''
@@ -375,7 +477,8 @@ class PKIManagerClient:
     """Client for PKI Manager API operations."""
 
     def __init__(self, module, api_url, oidc_url, client_id, client_secret,
-                 validate_certs=True, timeout=30, token_cache_path='/tmp/.pki_token_cache'):
+                 validate_certs=True, timeout=30, token_cache_path='/tmp/.pki_token_cache',
+                 fleet_token=None):
         self.module = module
         self.api_url = api_url.rstrip('/')
         self.oidc_url = oidc_url
@@ -384,10 +487,20 @@ class PKIManagerClient:
         self.validate_certs = validate_certs
         self.timeout = timeout
         self.token_cache_path = token_cache_path
+        # Fleet bearer token (pkimg_…) for the host-facing external SSH API.
+        self.fleet_token = fleet_token
         self.access_token = None
 
     def authenticate(self):
-        """Authenticate with OIDC and get access token."""
+        """Authenticate with OIDC and get access token.
+
+        OIDC is OPTIONAL: when no client credentials are supplied the client
+        makes unauthenticated requests. That covers a backend running with OIDC
+        disabled (ALLOW_UNAUTHENTICATED_SSH_CA=true), and the SSH host-facing
+        actions which authenticate with a fleet_token instead of OIDC.
+        """
+        if not (self.oidc_url and self.client_id and self.client_secret):
+            return False
         # Try to use cached token
         if self._load_cached_token():
             return True
@@ -450,9 +563,9 @@ class PKIManagerClient:
         if params:
             url = f"{url}?{urlencode(params)}"
 
-        headers = {
-            'Authorization': f"Bearer {self.access_token}",
-        }
+        headers = {}
+        if self.access_token:
+            headers['Authorization'] = f"Bearer {self.access_token}"
 
         body = None
         if data is not None:
@@ -478,35 +591,31 @@ class PKIManagerClient:
                 return {'status': status, 'data': None, 'error': None}
 
         except Exception as e:
-            # Handle HTTP errors
-            error_str = str(e)
-            status = 500
+            return self._err(e)
 
-            # Try to extract status code from exception
-            if hasattr(e, 'code'):
-                status = e.code
-            elif 'HTTP Error' in error_str:
-                try:
-                    status = int(error_str.split('HTTP Error ')[1].split(':')[0])
-                except (IndexError, ValueError):
-                    pass
-
-            # Handle common status codes
-            if status == 404:
-                return {'status': 404, 'data': None, 'error': 'Not found'}
-            if status == 409:
-                return {'status': 409, 'data': None, 'error': 'Conflict - operation blocked'}
-
-            # Try to get error message from response body
-            error_msg = error_str
-            if hasattr(e, 'read'):
-                try:
-                    error_data = json.loads(e.read())
-                    error_msg = error_data.get('error', {}).get('message', error_str)
-                except:
-                    pass
-
-            return {'status': status, 'data': None, 'error': error_msg}
+    def _err(self, e):
+        """Normalize an open_url exception into {status, data, error}."""
+        error_str = str(e)
+        status = 500
+        if hasattr(e, 'code'):
+            status = e.code
+        elif 'HTTP Error' in error_str:
+            try:
+                status = int(error_str.split('HTTP Error ')[1].split(':')[0])
+            except (IndexError, ValueError):
+                pass
+        error_msg = error_str
+        if hasattr(e, 'read'):
+            try:
+                error_data = json.loads(e.read())
+                error_msg = error_data.get('error', {}).get('message', error_str)
+            except Exception:
+                pass
+        if status == 404 and error_msg == error_str:
+            error_msg = 'Not found'
+        if status == 409 and error_msg == error_str:
+            error_msg = 'Conflict - operation blocked'
+        return {'status': status, 'data': None, 'error': error_msg}
 
     def get(self, endpoint, params=None):
         return self._request('GET', endpoint, params=params)
@@ -757,6 +866,238 @@ class PKIManagerClient:
             'msg': f"Certificate {cert_id} downloaded as {format}",
         }
 
+    # ========================= SSH workflow helpers =========================
+    def _origin(self):
+        """Return the server origin (api_url minus the /api/v1 suffix).
+
+        The SSH surface spans prefixes off one host: /api/v1/ssh (admin REST),
+        /api/v1/external/ssh (fleet-token host REST), and root-level public
+        downloads (/ssh/cert-authority, /ssh/trusted-user-ca-keys, ...). All
+        REST — no tRPC.
+        """
+        u = self.api_url
+        for suffix in ('/api/v1', '/api'):
+            if u.endswith(suffix):
+                return u[:-len(suffix)]
+        return u
+
+    def _get_text(self, path):
+        """GET a root-level text/plain resource (e.g. /ssh/cert-authority)."""
+        url = f"{self._origin()}{path}"
+        headers = {}
+        if self.access_token:
+            headers['Authorization'] = f"Bearer {self.access_token}"
+        try:
+            resp = open_url(url, headers=headers, method='GET',
+                            timeout=self.timeout, validate_certs=self.validate_certs)
+            return {'status': resp.getcode(), 'text': resp.read().decode('utf-8'), 'error': None}
+        except Exception as e:
+            err = self._err(e)
+            return {'status': err['status'], 'text': None, 'error': err['error']}
+
+    def _fleet_request(self, method, endpoint, data=None, extra_headers=None):
+        """Request the host-facing external API with the fleet bearer token."""
+        if not self.fleet_token:
+            return {'status': 400, 'data': None, 'error': 'fleet_token is required for host-facing SSH actions'}
+        url = f"{self.api_url}{endpoint}"
+        headers = {'Authorization': f"Bearer {self.fleet_token}"}
+        if extra_headers:
+            headers.update(extra_headers)
+        body = None
+        if data is not None:
+            headers['Content-Type'] = 'application/json'
+            body = json.dumps(data)
+        try:
+            resp = open_url(url, data=body, headers=headers, method=method,
+                            timeout=self.timeout, validate_certs=self.validate_certs)
+            try:
+                return {'status': resp.getcode(), 'data': json.loads(resp.read()), 'error': None}
+            except (json.JSONDecodeError, ValueError):
+                return {'status': resp.getcode(), 'data': None, 'error': None}
+        except Exception as e:
+            return self._err(e)
+
+    # ===================== SSH admin / operator actions =====================
+    def ssh_ca_create(self, ca_type, label=None):
+        payload = {'caType': ca_type}
+        if label:
+            payload['label'] = label
+        r = self.post('/ssh/cas', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'ssh_ca': r['data'], 'ca_id': r['data']['id'],
+                'msg': f"Created SSH {ca_type} CA {r['data']['id']}"}
+
+    def ssh_ca_list(self):
+        r = self.get('/ssh/cas')
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, 'ssh_cas': r['data'], 'msg': f"Found {len(r['data'])} SSH CAs"}
+
+    def ssh_token_mint(self, name, host_ca_id=None, user_ca_id=None, ops=None):
+        payload = {'name': name, 'opSet': ops or []}
+        if host_ca_id:
+            payload['hostCaId'] = host_ca_id
+        if user_ca_id:
+            payload['userCaId'] = user_ca_id
+        r = self.post('/ssh/tokens', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'token': r['data']['token'], 'ssh_token': r['data']['record'],
+                'msg': f"Minted fleet token {r['data']['record']['id']}"}
+
+    def ssh_identity_create(self, subject, email=None, external_subject=None):
+        payload = {'subject': subject}
+        if email:
+            payload['email'] = email
+        if external_subject:
+            payload['externalSubject'] = external_subject
+        r = self.post('/ssh/identities', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'ssh_identity': r['data'], 'identity_id': r['data']['id'],
+                'msg': f"Created SSH identity {subject}"}
+
+    def ssh_principal_create(self, name, description=None):
+        payload = {'name': name}
+        if description:
+            payload['description'] = description
+        r = self.post('/ssh/principals', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'ssh_principal': r['data'], 'principal_id': r['data']['id'],
+                'msg': f"Created SSH principal {name}"}
+
+    def ssh_principal_grant(self, identity_id, principal_id):
+        r = self.post('/ssh/principals/grant', {'identityId': identity_id, 'principalId': principal_id})
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'msg': f"Granted principal {principal_id} to identity {identity_id}"}
+
+    def ssh_principal_map(self, host_id, principal_id, local_account):
+        r = self.post('/ssh/principals/map', {'hostId': host_id, 'principalId': principal_id, 'localAccount': local_account})
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'msg': f"Mapped principal {principal_id} -> {local_account} on host {host_id}"}
+
+    def ssh_user_issue(self, identity_id, ssh_public_key, principals, ca_id=None,
+                       valid_for_seconds=None, enforce_entitlement=None):
+        payload = {'identityId': identity_id, 'sshPublicKey': ssh_public_key, 'principals': principals}
+        if ca_id:
+            payload['caId'] = ca_id
+        if valid_for_seconds:
+            payload['validForSeconds'] = valid_for_seconds
+        if enforce_entitlement is not None:
+            payload['enforceEntitlement'] = enforce_entitlement
+        r = self.post('/ssh/users/issue', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        cert = r['data'].get('cert', r['data'])
+        return {'changed': True, 'ssh_certificate': r['data'], 'cert_openssh': cert.get('certOpenssh'),
+                'msg': f"Issued SSH user cert for identity {identity_id}"}
+
+    def ssh_host_register(self, fqdn, ssh_public_key, addresses=None):
+        payload = {'fqdn': fqdn, 'opensshHostPubkey': ssh_public_key, 'addresses': addresses or []}
+        r = self.post('/ssh/hosts', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'ssh_host': r['data'], 'host_id': r['data']['id'],
+                'msg': f"Registered SSH host {fqdn}"}
+
+    def ssh_host_list(self, fqdn=None):
+        r = self.get('/ssh/hosts', params={'fqdn': fqdn} if fqdn else None)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        hosts = r['data'] or []
+        if fqdn:
+            return {'changed': False, 'ssh_hosts': hosts,
+                    'host_id': (hosts[0]['id'] if hosts else None),
+                    'msg': (f"Resolved host {fqdn}" if hosts else f"Host {fqdn} not found")}
+        return {'changed': False, 'ssh_hosts': hosts, 'msg': f"Found {len(hosts)} SSH hosts"}
+
+    def ssh_block(self, host_id, identity_id, reason=None):
+        payload = {'hostId': host_id, 'identityId': identity_id}
+        if reason:
+            payload['reason'] = reason
+        r = self.post('/ssh/blocks', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'ssh_block': r['data'],
+                'msg': f"Blocked identity {identity_id} on host {host_id}"}
+
+    def ssh_unblock(self, host_id, identity_id):
+        r = self.post('/ssh/blocks/unblock', {'hostId': host_id, 'identityId': identity_id})
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'msg': f"Unblocked identity {identity_id} on host {host_id}"}
+
+    def ssh_auth_principals(self, host_id):
+        r = self.get(f'/ssh/hosts/{host_id}/auth-principals')
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, 'auth_principals': r['data'],
+                'msg': f"Rendered auth_principals for host {host_id}"}
+
+    def ssh_sshd_config(self, host_id):
+        """The authoritative, algorithm-aware sshd drop-in for a host."""
+        r = self._get_text(f"/ssh/hosts/{host_id}/sshd-config")
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, 'sshd_config': r['text'],
+                'msg': f"Rendered sshd drop-in for host {host_id}"}
+
+    def ssh_cert_authority(self, pattern='*'):
+        r = self._get_text(f"/ssh/cert-authority?pattern={quote(pattern)}")
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, 'cert_authority': (r['text'] or '').strip(),
+                'msg': "Fetched @cert-authority line"}
+
+    def ssh_trusted_user_ca(self):
+        r = self._get_text('/ssh/trusted-user-ca-keys')
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, 'trusted_user_ca_keys': r['text'], 'msg': "Fetched TrustedUserCAKeys"}
+
+    def ssh_host_ca(self):
+        r = self._get_text('/ssh/host-ca-keys')
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, 'host_ca_keys': r['text'], 'msg': "Fetched Host-CA trust anchor"}
+
+    # =================== SSH host-facing actions (fleet token) ==============
+    def ssh_sign_host(self, fqdn, ssh_public_key, addresses=None,
+                      idempotency_key=None, valid_for_seconds=None, key_id=None):
+        payload = {'fqdn': fqdn, 'opensshHostPubkey': ssh_public_key, 'addresses': addresses or []}
+        if valid_for_seconds:
+            payload['validForSeconds'] = valid_for_seconds
+        if key_id:
+            payload['keyId'] = key_id
+        extra = {'Idempotency-Key': idempotency_key} if idempotency_key else None
+        r = self._fleet_request('POST', '/external/ssh/sign-host', payload, extra)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'ssh_host_cert': r['data'],
+                'host_id': (r['data'] or {}).get('hostId'),
+                'cert_openssh': (r['data'] or {}).get('certOpenssh'),
+                'msg': f"Signed host cert for {fqdn}"}
+
+    def ssh_register_host_pubkey(self, fqdn):
+        r = self._fleet_request('POST', '/external/ssh/register-host-pubkey', {'fqdn': fqdn})
+        if r['status'] == 501:
+            return {'changed': False, 'failed': True,
+                    'msg': 'ECIES KRL path disabled on the backend (set SSH_ECIES_ENABLED=true)'}
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'msg': f"Registered ECIES key for {fqdn}"}
+
+    def ssh_get_principals(self, fqdn):
+        r = self._fleet_request('GET', f'/external/ssh/hosts/{fqdn}/auth-principals')
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, 'auth_principals': r['data'],
+                'msg': f"Fetched auth_principals for {fqdn}"}
+
 
 def run_module():
     """Run the Ansible module."""
@@ -765,11 +1106,21 @@ def run_module():
             'auth_test', 'stats', 'expiring', 'search',
             'ca_create', 'ca_list', 'ca_get', 'ca_revoke', 'ca_delete',
             'cert_issue', 'cert_list', 'cert_get', 'cert_renew', 'cert_revoke', 'cert_delete', 'cert_download',
+            # SSH workflow — admin/operator (OIDC or unauthenticated)
+            'ssh_ca_create', 'ssh_ca_list', 'ssh_token_mint',
+            'ssh_identity_create', 'ssh_principal_create', 'ssh_principal_grant', 'ssh_principal_map',
+            'ssh_user_issue', 'ssh_host_register', 'ssh_host_list',
+            'ssh_block', 'ssh_unblock', 'ssh_auth_principals', 'ssh_sshd_config',
+            'ssh_cert_authority', 'ssh_trusted_user_ca', 'ssh_host_ca',
+            # SSH workflow — host-facing (fleet-token)
+            'ssh_sign_host', 'ssh_register_host_pubkey', 'ssh_get_principals',
         ]),
         api_url=dict(type='str', required=True),
-        oidc_url=dict(type='str', required=True),
-        client_id=dict(type='str', required=True),
-        client_secret=dict(type='str', required=True, no_log=True),
+        # OIDC is optional: omit for a backend with OIDC disabled
+        # (ALLOW_UNAUTHENTICATED_SSH_CA=true) or for fleet-token host actions.
+        oidc_url=dict(type='str'),
+        client_id=dict(type='str'),
+        client_secret=dict(type='str', no_log=True),
         # CA options
         ca_id=dict(type='str'),
         ca_cn=dict(type='str'),
@@ -812,6 +1163,32 @@ def run_module():
         search_query=dict(type='str'),
         search_limit=dict(type='int', default=10),
         expiring_limit=dict(type='int', default=5),
+        # SSH workflow
+        ssh_ca_type=dict(type='str', choices=['user', 'host']),
+        ssh_ca_label=dict(type='str'),
+        token_name=dict(type='str'),
+        token_ops=dict(type='list', elements='str'),
+        host_ca_id=dict(type='str'),
+        user_ca_id=dict(type='str'),
+        identity_id=dict(type='str'),
+        identity_subject=dict(type='str'),
+        identity_email=dict(type='str'),
+        principal_id=dict(type='str'),
+        principal_name=dict(type='str'),
+        principal_description=dict(type='str'),
+        host_id=dict(type='str'),
+        host_fqdn=dict(type='str'),
+        host_pubkey=dict(type='str'),
+        host_addresses=dict(type='list', elements='str'),
+        local_account=dict(type='str'),
+        ssh_public_key=dict(type='str'),
+        principals=dict(type='list', elements='str'),
+        user_valid_seconds=dict(type='int'),
+        enforce_entitlement=dict(type='bool'),
+        cert_authority_pattern=dict(type='str', default='*'),
+        block_reason=dict(type='str'),
+        idempotency_key=dict(type='str'),
+        fleet_token=dict(type='str', no_log=True),
         # Connection
         validate_certs=dict(type='bool', default=True),
         timeout=dict(type='int', default=30),
@@ -833,6 +1210,22 @@ def run_module():
             ('action', 'cert_delete', ['cert_id']),
             ('action', 'cert_download', ['cert_id']),
             ('action', 'search', ['search_query']),
+            # SSH workflow
+            ('action', 'ssh_ca_create', ['ssh_ca_type']),
+            ('action', 'ssh_token_mint', ['token_name', 'token_ops']),
+            ('action', 'ssh_identity_create', ['identity_subject']),
+            ('action', 'ssh_principal_create', ['principal_name']),
+            ('action', 'ssh_principal_grant', ['identity_id', 'principal_id']),
+            ('action', 'ssh_principal_map', ['host_id', 'principal_id', 'local_account']),
+            ('action', 'ssh_user_issue', ['identity_id', 'ssh_public_key', 'principals']),
+            ('action', 'ssh_host_register', ['host_fqdn', 'host_pubkey']),
+            ('action', 'ssh_block', ['host_id', 'identity_id']),
+            ('action', 'ssh_unblock', ['host_id', 'identity_id']),
+            ('action', 'ssh_auth_principals', ['host_id']),
+            ('action', 'ssh_sshd_config', ['host_id']),
+            ('action', 'ssh_sign_host', ['host_fqdn', 'host_pubkey', 'fleet_token']),
+            ('action', 'ssh_register_host_pubkey', ['host_fqdn', 'fleet_token']),
+            ('action', 'ssh_get_principals', ['host_fqdn', 'fleet_token']),
         ],
     )
 
@@ -848,9 +1241,10 @@ def run_module():
         validate_certs=module.params['validate_certs'],
         timeout=module.params['timeout'],
         token_cache_path=module.params['token_cache_path'],
+        fleet_token=module.params.get('fleet_token'),
     )
 
-    # Authenticate
+    # Authenticate (OIDC; no-op when no client credentials are supplied)
     client.authenticate()
 
     # Execute action
@@ -976,6 +1370,121 @@ def run_module():
                 password=module.params.get('download_password'),
                 dest=module.params.get('download_dest'),
             )
+
+    # ---- SSH workflow actions ----
+    elif action == 'ssh_ca_create':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'SSH CA would be created (check mode)'}
+        else:
+            result = client.ssh_ca_create(module.params['ssh_ca_type'], module.params.get('ssh_ca_label'))
+
+    elif action == 'ssh_ca_list':
+        result = client.ssh_ca_list()
+
+    elif action == 'ssh_token_mint':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'Fleet token would be minted (check mode)'}
+        else:
+            result = client.ssh_token_mint(
+                name=module.params['token_name'],
+                host_ca_id=module.params.get('host_ca_id'),
+                user_ca_id=module.params.get('user_ca_id'),
+                ops=module.params.get('token_ops'),
+            )
+
+    elif action == 'ssh_identity_create':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'SSH identity would be created (check mode)'}
+        else:
+            result = client.ssh_identity_create(module.params['identity_subject'], module.params.get('identity_email'))
+
+    elif action == 'ssh_principal_create':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'SSH principal would be created (check mode)'}
+        else:
+            result = client.ssh_principal_create(module.params['principal_name'], module.params.get('principal_description'))
+
+    elif action == 'ssh_principal_grant':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'Entitlement would be granted (check mode)'}
+        else:
+            result = client.ssh_principal_grant(module.params['identity_id'], module.params['principal_id'])
+
+    elif action == 'ssh_principal_map':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'Principal would be mapped (check mode)'}
+        else:
+            result = client.ssh_principal_map(module.params['host_id'], module.params['principal_id'], module.params['local_account'])
+
+    elif action == 'ssh_user_issue':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'SSH user cert would be issued (check mode)'}
+        else:
+            result = client.ssh_user_issue(
+                identity_id=module.params['identity_id'],
+                ssh_public_key=module.params['ssh_public_key'],
+                principals=module.params['principals'],
+                ca_id=module.params.get('user_ca_id'),
+                valid_for_seconds=module.params.get('user_valid_seconds'),
+                enforce_entitlement=module.params.get('enforce_entitlement'),
+            )
+
+    elif action == 'ssh_host_register':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'SSH host would be registered (check mode)'}
+        else:
+            result = client.ssh_host_register(module.params['host_fqdn'], module.params['host_pubkey'], module.params.get('host_addresses'))
+
+    elif action == 'ssh_host_list':
+        result = client.ssh_host_list(module.params.get('host_fqdn'))
+
+    elif action == 'ssh_block':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'Identity would be blocked (check mode)'}
+        else:
+            result = client.ssh_block(module.params['host_id'], module.params['identity_id'], module.params.get('block_reason'))
+
+    elif action == 'ssh_unblock':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'Identity would be unblocked (check mode)'}
+        else:
+            result = client.ssh_unblock(module.params['host_id'], module.params['identity_id'])
+
+    elif action == 'ssh_auth_principals':
+        result = client.ssh_auth_principals(module.params['host_id'])
+
+    elif action == 'ssh_sshd_config':
+        result = client.ssh_sshd_config(module.params['host_id'])
+
+    elif action == 'ssh_cert_authority':
+        result = client.ssh_cert_authority(module.params.get('cert_authority_pattern', '*'))
+
+    elif action == 'ssh_trusted_user_ca':
+        result = client.ssh_trusted_user_ca()
+
+    elif action == 'ssh_host_ca':
+        result = client.ssh_host_ca()
+
+    elif action == 'ssh_sign_host':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'Host cert would be signed (check mode)'}
+        else:
+            result = client.ssh_sign_host(
+                fqdn=module.params['host_fqdn'],
+                ssh_public_key=module.params['host_pubkey'],
+                addresses=module.params.get('host_addresses'),
+                idempotency_key=module.params.get('idempotency_key'),
+                valid_for_seconds=module.params.get('user_valid_seconds'),
+            )
+
+    elif action == 'ssh_register_host_pubkey':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'ECIES key would be registered (check mode)'}
+        else:
+            result = client.ssh_register_host_pubkey(module.params['host_fqdn'])
+
+    elif action == 'ssh_get_principals':
+        result = client.ssh_get_principals(module.params['host_fqdn'])
 
     # Return result
     if result.get('failed'):
