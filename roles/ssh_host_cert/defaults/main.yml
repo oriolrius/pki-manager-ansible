@@ -24,12 +24,13 @@ ssh_ca_fleet_token: ""
 ssh_host_cert_validate_certs: true
 
 # --- Host key algorithm ------------------------------------------------------
-# ed25519 by default. When ECIES is enabled the host key MUST be an
-# ecdsa-sha2-nistp256 key (decision-015 reuse model): the SAME key sshd presents
-# is the key the backend encrypts the per-host KRL to and krl-client decrypts
-# with at /etc/ssh/ssh_host_ecdsa_key. ECIES is P-256-only, so an ed25519 host
-# 409s ECIES_KEY_UNSUPPORTED on register-host-pubkey.
-ssh_host_cert_key_type: "{{ 'ecdsa' if ssh_host_cert_ecies_enabled | bool else 'ed25519' }}"
+# ALWAYS ecdsa-sha2-nistp256. The backend accepts host keys of this one type: the
+# SAME key is the certificate subject AND (for ECIES) the key the per-host KRL is
+# encrypted to / krl-client decrypts with at /etc/ssh/ssh_host_ecdsa_key. An
+# ed25519 signing key can't do ECDH key agreement, so it can never be an ECIES
+# recipient — registering one now fails up front (not just on ECIES). Non-ECIES
+# hosts also use ecdsa; the (unencrypted) legacy KRL channel is algorithm-agnostic.
+ssh_host_cert_key_type: ecdsa
 ssh_host_cert_ecdsa_size: 256
 
 # --- Layout on the node (mirrors ssh-config.ts) ------------------------------
