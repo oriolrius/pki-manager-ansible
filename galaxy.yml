@@ -1,7 +1,7 @@
 ---
 namespace: oriolrius
 name: pki_manager
-version: 2.4.0
+version: 2.5.0
 readme: README.md
 authors:
   - Oriol Rius <oriol@joor.net>
@@ -27,3 +27,6 @@ build_ignore:
   - .git
   - .gitignore
   - "*.tar.gz"
+  # Secrets for publishing (ANSIBLE_GALAXY_API_KEY) must never be packaged.
+  - .env
+  - ".env.*"
