@@ -204,8 +204,9 @@ The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
 | `ssh_sign_host` | Sign host cert (fleet-token) | `host_fqdn`, `host_pubkey`, `fleet_token`, `user_valid_seconds`, `idempotency_key` |
 | `ssh_register_host_pubkey` | Register ECIES host key (fleet-token) | `host_fqdn`, `fleet_token` |
 | `ssh_get_principals` | Fetch host `auth_principals` (fleet-token) | `host_fqdn`, `fleet_token` |
+| `ssh_principals_pushed` | Acknowledge the installed principal files so the host is not Stale (fleet-token; 409 `SHA256_MISMATCH` fails with `sha256_mismatch`/`current_sha256`; no-op in check mode) | `host_fqdn`, `fleet_token`, `principals_sha256` |
 
-X.509 and SSH-admin actions hit `{api_url}/…` with the optional OIDC Bearer. Host-facing actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`) hit `/external/ssh` with the `fleet_token` Bearer. `required_if` enforces per-action mandatory parameters (e.g. `ssh_sign_host` requires `host_fqdn` + `host_pubkey` + `fleet_token`).
+X.509 and SSH-admin actions hit `{api_url}/…` with the optional OIDC Bearer. Host-facing actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`, `ssh_principals_pushed`) hit `/external/ssh` with the `fleet_token` Bearer. `required_if` enforces per-action mandatory parameters (e.g. `ssh_sign_host` requires `host_fqdn` + `host_pubkey` + `fleet_token`).
 
 ---
 
@@ -324,7 +325,7 @@ The collection supports three modes:
 
 - **OIDC (optional)** — set `oidc_url` + `client_id` + `client_secret` for client-credentials auth; tokens are cached at `token_cache_path` (`0600`, 60 s buffer).
 - **Unauthenticated** — omit OIDC entirely against a backend started with `ALLOW_UNAUTHENTICATED_SSH_CA=true`.
-- **Fleet token** — host-facing SSH actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`) use a `pkimg_…` `fleet_token` bearer against `/external/ssh`.
+- **Fleet token** — host-facing SSH actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`, `ssh_principals_pushed`) use a `pkimg_…` `fleet_token` bearer against `/external/ssh`.
 
 **Backend prerequisites for SSH:** `SSH_ECIES_ENABLED=true` (encrypted-KRL channel), `ALLOW_UNAUTHENTICATED_SSH_CA=true` (when OIDC is off), `SSH_HOST_KRL_PUBLIC=true` (per-host public KRL blocks), and NTP/chrony on every host.
 

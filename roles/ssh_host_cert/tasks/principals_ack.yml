@@ -1,0 +1,55 @@
+---
+# TASK-250: tell PKI Manager the principal files are installed (and sshd has
+# been reloaded by sshd.yml) so the host stops being "Stale". Runs only when
+# files changed in this run or the backend reported stale: true, and never in
+# check mode. A 409 SHA256_MISMATCH (mappings changed after our GET) triggers
+# one re-fetch + re-install + re-acknowledge; a second mismatch fails the run.
+- name: Decide whether to acknowledge the principal push
+  ansible.builtin.set_fact:
+    ssh_host_cert_principals_ack_needed: >-
+      {{ (ssh_host_cert_principals_install.changed | default(false))
+         or (ssh_host_cert_principals.auth_principals.stale | default(false)) }}
+
+- name: Acknowledge the installed principals (principals-pushed)
+  oriolrius.pki_manager.pki_manager:
+    action: ssh_principals_pushed
+    api_url: "{{ ssh_host_cert_api_v1 }}"
+    validate_certs: "{{ ssh_host_cert_validate_certs }}"
+    fleet_token: "{{ ssh_ca_fleet_token }}"
+    host_fqdn: "{{ ansible_fqdn }}"
+    principals_sha256: "{{ ssh_host_cert_principals.auth_principals.sha256 }}"
+  register: ssh_host_cert_principals_ack
+  delegate_to: localhost
+  become: false
+  no_log: true  # contains the bearer token
+  ignore_errors: true
+  when:
+    - not ansible_check_mode
+    - ssh_host_cert_principals_ack_needed | bool
+
+- name: Re-fetch, re-install and re-acknowledge after SHA256_MISMATCH (once)
+  when:
+    - ssh_host_cert_principals_ack is failed
+    - ssh_host_cert_principals_ack.sha256_mismatch | default(false)
+  block:
+    - name: Fetch and install the current principal files
+      ansible.builtin.include_tasks: principals_sync.yml
+
+    - name: Acknowledge the re-installed principals
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principals_pushed
+        api_url: "{{ ssh_host_cert_api_v1 }}"
+        validate_certs: "{{ ssh_host_cert_validate_certs }}"
+        fleet_token: "{{ ssh_ca_fleet_token }}"
+        host_fqdn: "{{ ansible_fqdn }}"
+        principals_sha256: "{{ ssh_host_cert_principals.auth_principals.sha256 }}"
+      delegate_to: localhost
+      become: false
+      no_log: true  # contains the bearer token
+
+- name: Fail on a principals-pushed error that is not a SHA256 mismatch
+  ansible.builtin.fail:
+    msg: "principals-pushed failed for {{ ansible_fqdn }}: {{ ssh_host_cert_principals_ack.msg | default('unknown error') }}"
+  when:
+    - ssh_host_cert_principals_ack is failed
+    - not (ssh_host_cert_principals_ack.sha256_mismatch | default(false))

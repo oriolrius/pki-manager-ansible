@@ -37,6 +37,12 @@
 - name: Install the authoritative sshd drop-in
   ansible.builtin.include_tasks: sshd.yml
 
+# Acknowledge the installed principals only after sshd -t + reload (sshd.yml
+# flushes handlers), so a host is never marked pushed before it is live.
+- name: Acknowledge the principal push (clears Stale in PKI Manager)
+  ansible.builtin.include_tasks: principals_ack.yml
+  when: ssh_host_cert_principals_enabled | bool
+
 # ── PHASE 4: unattended renewal ─────────────────────────────────────────────
 - name: Install unattended host-cert renewal
   ansible.builtin.include_tasks: renewal.yml
