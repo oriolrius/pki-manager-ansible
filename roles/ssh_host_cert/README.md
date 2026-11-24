@@ -9,7 +9,9 @@ What one run does: generate the host key → `ssh_sign_host` + install the cert 
 install the **User-CA** and **Host-CA** trust anchors → populate
 `/etc/ssh/auth_principals/<account>` (login RBAC) + a fail-closed `RevokedKeys`
 placeholder → install the authoritative, algorithm-aware sshd drop-in
-(`ssh_sshd_config`) → `sshd -t` + reload → install unattended renewal →
+(`ssh_sshd_config`) → `sshd -t` + reload → acknowledge the principal push
+(`ssh_principals_pushed`, so the host is not *Stale*; skipped in check mode, retried
+once on `409 SHA256_MISMATCH`) → install unattended renewal →
 *(ECIES)* register the ecdsa key + install the `krl-client` puller.
 
 ## Requirements

@@ -59,6 +59,7 @@ options:
             - ssh_sign_host
             - ssh_register_host_pubkey
             - ssh_get_principals
+            - ssh_principals_pushed
     api_url:
         description:
             - PKI Manager API URL.
@@ -257,7 +258,14 @@ options:
     fleet_token:
         description:
             - Fleet bearer token (pkimg_...) for the host-facing external SSH API
-              (ssh_sign_host, ssh_register_host_pubkey, ssh_get_principals).
+              (ssh_sign_host, ssh_register_host_pubkey, ssh_get_principals, ssh_principals_pushed).
+        type: str
+    principals_sha256:
+        description:
+            - Canonical sha256 (64 hex, a C(sha256:) prefix is accepted) of the principal files the host installed,
+              as returned in C(auth_principals.sha256) by C(ssh_get_principals). Required for C(ssh_principals_pushed).
+            - The backend answers 409 SHA256_MISMATCH when it is not the hash of the current render; the action then fails
+              with C(sha256_mismatch=true) and C(current_sha256) so the caller can fetch and install again.
         type: str
     ssh_ca_type:
         description: SSH CA type for ssh_ca_create.
@@ -453,6 +461,18 @@ downloaded_file:
     description: Path to downloaded file (for cert_download).
     type: str
     returned: when action is cert_download
+sha256_mismatch:
+    description: True when the backend refused the acknowledgement with 409 SHA256_MISMATCH (ssh_principals_pushed; the action fails).
+    type: bool
+    returned: when action is ssh_principals_pushed and the hash is not the current render
+current_sha256:
+    description: Hash of the current principal render, sent by the backend with the 409 (ssh_principals_pushed).
+    type: str
+    returned: when sha256_mismatch is true
+principals_pushed:
+    description: Backend acknowledgement (hostId, fqdn, lastPrincipalPushAt, sha256) for ssh_principals_pushed.
+    type: dict
+    returned: when action is ssh_principals_pushed and it succeeded
 msg:
     description: Status message.
     type: str
@@ -605,9 +625,11 @@ class PKIManagerClient:
             except (IndexError, ValueError):
                 pass
         error_msg = error_str
+        body = None
         if hasattr(e, 'read'):
             try:
                 error_data = json.loads(e.read())
+                body = error_data
                 error_msg = error_data.get('error', {}).get('message', error_str)
             except Exception:
                 pass
@@ -615,7 +637,7 @@ class PKIManagerClient:
             error_msg = 'Not found'
         if status == 409 and error_msg == error_str:
             error_msg = 'Conflict - operation blocked'
-        return {'status': status, 'data': None, 'error': error_msg}
+        return {'status': status, 'data': None, 'error': error_msg, 'body': body}
 
     def get(self, endpoint, params=None):
         return self._request('GET', endpoint, params=params)
@@ -1098,6 +1120,23 @@ class PKIManagerClient:
         return {'changed': False, 'auth_principals': r['data'],
                 'msg': f"Fetched auth_principals for {fqdn}"}
 
+    def ssh_principals_pushed(self, fqdn, sha256):
+        """Acknowledge that the principal files were installed (marks the host not stale)."""
+        r = self._fleet_request('POST', f'/external/ssh/hosts/{fqdn}/principals-pushed', {'sha256': sha256})
+        if r['status'] == 409 and isinstance(r.get('body'), dict):
+            code = (r['body'].get('error') or {}).get('code')
+            if code == 'SHA256_MISMATCH':
+                return {'changed': False, 'failed': True, 'sha256_mismatch': True,
+                        'current_sha256': r['body'].get('currentSha256'),
+                        'msg': f"SHA256_MISMATCH for {fqdn}: the principal mappings changed after the fetch "
+                               "(fetch and install again, then acknowledge)"}
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        data = r['data'] or {}
+        return {'changed': True, 'principals_pushed': data,
+                'last_principal_push_at': data.get('lastPrincipalPushAt'),
+                'msg': f"Acknowledged principal push for {fqdn}"}
+
 
 def run_module():
     """Run the Ansible module."""
@@ -1114,6 +1153,7 @@ def run_module():
             'ssh_cert_authority', 'ssh_trusted_user_ca', 'ssh_host_ca',
             # SSH workflow — host-facing (fleet-token)
             'ssh_sign_host', 'ssh_register_host_pubkey', 'ssh_get_principals',
+            'ssh_principals_pushed',
         ]),
         api_url=dict(type='str', required=True),
         # OIDC is optional: omit for a backend with OIDC disabled
@@ -1178,6 +1218,7 @@ def run_module():
         principal_description=dict(type='str'),
         host_id=dict(type='str'),
         host_fqdn=dict(type='str'),
+        principals_sha256=dict(type='str'),
         host_pubkey=dict(type='str'),
         host_addresses=dict(type='list', elements='str'),
         local_account=dict(type='str'),
@@ -1226,6 +1267,7 @@ def run_module():
             ('action', 'ssh_sign_host', ['host_fqdn', 'host_pubkey', 'fleet_token']),
             ('action', 'ssh_register_host_pubkey', ['host_fqdn', 'fleet_token']),
             ('action', 'ssh_get_principals', ['host_fqdn', 'fleet_token']),
+            ('action', 'ssh_principals_pushed', ['host_fqdn', 'fleet_token', 'principals_sha256']),
         ],
     )
 
@@ -1485,6 +1527,12 @@ def run_module():
 
     elif action == 'ssh_get_principals':
         result = client.ssh_get_principals(module.params['host_fqdn'])
+
+    elif action == 'ssh_principals_pushed':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'Principal push would be acknowledged (check mode)'}
+        else:
+            result = client.ssh_principals_pushed(module.params['host_fqdn'], module.params['principals_sha256'])
 
     # Return result
     if result.get('failed'):

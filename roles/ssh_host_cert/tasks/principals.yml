@@ -4,19 +4,6 @@
 # cert is denied ("Permission denied"). Fetch the authoritative per-account
 # render (ANS-01, byte-identical to the admin tRPC render) with the fleet token
 # and install each account file.
-- name: Fetch this host's rendered auth_principals (fleet-token, ANS-01)
-  oriolrius.pki_manager.pki_manager:
-    action: ssh_get_principals
-    api_url: "{{ ssh_host_cert_api_v1 }}"
-    validate_certs: "{{ ssh_host_cert_validate_certs }}"
-    fleet_token: "{{ ssh_ca_fleet_token }}"
-    host_fqdn: "{{ ansible_fqdn }}"
-  register: ssh_host_cert_principals
-  delegate_to: localhost
-  become: false
-  changed_when: false
-  no_log: true  # contains the bearer token
-
 - name: Create the AuthorizedPrincipalsFile directory
   ansible.builtin.file:
     path: "{{ ssh_host_cert_auth_principals_dir }}"
@@ -26,17 +13,8 @@
     mode: "0755"
   become: true
 
-- name: Install per-account principal files
-  ansible.builtin.copy:
-    content: "{{ item.value }}"
-    dest: "{{ ssh_host_cert_auth_principals_dir }}/{{ item.key }}"
-    owner: root
-    group: root
-    mode: "0644"
-  become: true
-  loop: "{{ ssh_host_cert_principals.auth_principals.files | dict2items }}"
-  loop_control:
-    label: "{{ item.key }}"
+- name: Fetch and install the per-account principal files
+  ansible.builtin.include_tasks: principals_sync.yml
 
 # Optional prune: drop account files that are no longer in the render so a
 # de-mapped account loses its principals. Off by default (operator files may
