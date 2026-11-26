@@ -35,6 +35,8 @@ the certificate id, a hash of the request, and `notAfter`. A run issues a new ce
 - the certificate expires within `pki_cert_renew_before_days` (default 30), or
 - `force: true` is set on the entry (or `pki_cert_force: true`).
 
+- the fullchain file has a private key (written by a role before 3.0.1): the old certificate is then revoked with reason `keyCompromise`.
+
 Otherwise the role changes nothing and does not notify the handlers. When it issues a new certificate,
 it revokes the one it replaces with reason `superseded` (set `pki_revoke_replaced: false` to keep it).
 

@@ -2,7 +2,7 @@
 
 **`oriolrius.pki_manager`** — an Ansible collection for managing **both X.509 certificates and the SSH certificate workflow** through the PKI Manager REST API (one module plus two host-setup roles).
 
-- **Version:** 3.0.0 (tested against PKI Manager 3.19.0)
+- **Version:** 3.0.1 (tested against PKI Manager 3.19.0)
 - **Collection (FQCN):** `oriolrius.pki_manager`
 - **Requires:** Ansible `>=2.14.0`, `community.crypto >=2.0.0`
 - **Repository:** https://github.com/oriolrius/pki-manager-ansible
@@ -179,6 +179,7 @@ The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
 | `cert_revoke` | Revoke a certificate | `cert_id`, `revocation_reason` |
 | `cert_delete` | Delete a certificate | `cert_id` |
 | `cert_download` | Download certificate in a format | `cert_id`, `download_format`, `download_password`, `download_dest` |
+| `cert_find` | Find the certificate with the serial of a PEM (needs Python `cryptography`) | `cert_pem` |
 
 ### SSH actions
 
@@ -238,8 +239,8 @@ When `api_token` and `oidc_url`/`client_id`/`client_secret` are absent, the modu
 
 - **X.509 CA** — `ca_id`, `ca_cn`/`ca_org`/`ca_country` (required for `ca_create`), optional `ca_ou`/`ca_state`/`ca_locality`, `ca_algorithm` (`RSA-2048|RSA-4096`, default `RSA-4096`; the API takes only RSA for a CA), `ca_validity_years` (1-30; server default 20). `ca_validity` (days) is deprecated: the module rounds it to years.
 - **X.509 certificate** — `cert_id`, `cert_cn`, `cert_org` and `cert_country` (required for `cert_issue`), optional `cert_ou`/`cert_state`/`cert_locality`, `cert_type` (default `server` for `cert_issue`; a filter for `cert_list`), `cert_status` (filter for `cert_list`), `cert_algorithm` (default `RSA-2048`), `cert_validity` (days, default `365`), SAN lists `cert_dns_names`/`cert_ip_addresses`/`cert_emails`.
-- **Downloads** — `download_format` (default `pem`): `pem`, `der`, `chain-pem`, `full-pem`, `full-der`, `key-pem`, `key-der`, `csr-pem`, `p12`, `pfx`, `pkcs8-pem`, `pkcs8-der`, `pkcs8-encrypted`, `jks-keystore`, `jks-truststore`. `download_password` is required for `p12`/`pfx`/`jks-keystore`/`jks-truststore`/`pkcs8-encrypted`. The password goes in the `X-Export-Password` header, never in the URL. `download_dest` is written `chmod 0600`; if omitted, content is returned base64-encoded. The REST `chain-pem` format returns only the certificate (server bug); `full-pem` has the certificate and the CA.
-- **Revocation** — `revocation_reason` (shared by `ca_revoke` and `cert_revoke`): `unspecified` (default), `keyCompromise`, `caCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`.
+- **Downloads** — `download_format` (default `pem`): `pem`, `der`, `chain-pem`, `full-pem`, `full-der`, `key-pem`, `key-der`, `csr-pem`, `p12`, `pfx`, `pkcs8-pem`, `pkcs8-der`, `pkcs8-encrypted`, `jks-keystore`, `jks-truststore`. `download_password` is required for `p12`/`pfx`/`jks-keystore`/`jks-truststore`/`pkcs8-encrypted`. The password goes in the `X-Export-Password` header, never in the URL. `download_dest` is written `chmod 0600`; if omitted, content is returned base64-encoded. `chain-pem` is certificate + issuing CA and `full-pem` is certificate + **private key** + issuing CA (PKI Manager 3.19.1+; before, `chain-pem` had no CA and `full-pem` had no chain). Never write `full-pem` to a file that others can read. `download_dest` is idempotent: the same content with mode 0600 gives `changed: false`, and check mode reports the change without writing.
+- **Revocation** — `revocation_details` (free text) and `revocation_reason` (shared by `ca_revoke` and `cert_revoke`): `unspecified` (default), `keyCompromise`, `caCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`.
 - **Lists** — `ca_list` and `cert_list` read every page, so `cas`/`certificates` hold all items (not only the first 50).
 - **Search / dashboards** — `search_query` (required for `search`), `search_limit` (default `10`), `expiring_limit` (default `5`, capped at `20`).
 - **SSH** — `ssh_ca_type` (`user|host`), `ssh_ca_label`; `token_name`, `token_ops` (e.g. `sign-host`/`get-principals`/`register-host-pubkey`), `host_ca_id`/`user_ca_id`; `identity_id`/`identity_subject`/`identity_email`/`identity_external_subject`; `principal_id`/`principal_name`/`principal_description`; `host_id`/`host_fqdn`/`host_pubkey`/`host_addresses`/`local_account`; `ssh_public_key`, `principals`, `user_valid_seconds` (`validForSeconds` of `ssh_user_issue`), `host_valid_seconds` and `host_key_id` (`ssh_sign_host`; `user_valid_seconds` is still accepted there when `host_valid_seconds` is not set), `enforce_entitlement`; `cert_authority_pattern` (default `*`), `block_reason`, `idempotency_key` (`Idempotency-Key` header for `ssh_sign_host`).
@@ -271,7 +272,9 @@ Provisions Ubuntu hosts with X.509 certificates issued from the PKI Manager REST
 | `pki_cert_force` | `false` | Issue again on every run (or `force: true` on one entry) |
 | `pki_revoke_replaced` | `true` | Revoke (`superseded`) the certificate a new one replaces |
 
-The default DNS SANs are `ansible_fqdn` and `ansible_hostname`, but only the names with two or more labels: the API rejects `web`. A host with no FQDN must set `cn` (and `dns_names`) for a `server` or `dual` certificate. The chain file is the CA certificate.
+The default DNS SANs are `ansible_fqdn` and `ansible_hostname`, but only the names with two or more labels: the API rejects `web`. A host with no FQDN must set `cn` (and `dns_names`) for a `server` or `dual` certificate. The role builds `<name>-chain.crt` (the issuing CA) and `<name>-fullchain.crt` (certificate + issuing CA) itself; the key is only in `<name>.key` (0640, group `ssl-cert`).
+
+> **Security (fixed in 3.0.1):** up to 3.0.0 the role wrote the REST `full-pem` download — certificate **and private key** — to `<name>-fullchain.crt` with mode 0644, so every local user could read the key. From 3.0.1 the role finds such a file, issues a new certificate, writes a clean fullchain file, and revokes the old certificate with reason `keyCompromise` (a host set up before 3.0.0 has no state file: the role finds the old certificate by its serial). Run the role once on every host that used an older version.
 
 Full docs: [`roles/pki_host_setup/README.md`](roles/pki_host_setup/README.md).
 
