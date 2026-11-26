@@ -336,7 +336,7 @@ The collection supports three modes:
 | Project | Description |
 |---|---|
 | [PKI Manager](https://github.com/oriolrius/pki-manager-web) | Main PKI Manager web application |
-| [PKI Manager CLI](https://github.com/oriolrius/pki-manager-cli) | Python CLI tool for PKI Manager |
+| [PKI Manager CLI](https://github.com/oriolrius/pki-manager-cli) | CLI for PKI Manager (`pki`, one static binary for Linux, Windows and macOS) |
 | [PKI Manager Skill](https://github.com/oriolrius/pki-manager-skill) | Claude Code skill for AI-assisted certificate management |
 
 ---
