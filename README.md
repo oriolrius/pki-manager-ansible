@@ -358,15 +358,19 @@ CI (`.github/workflows/ci.yml`) runs on every pull request:
 
 - **Lint**: `ansible-lint` (production profile) and `yamllint`.
 - **Sanity**: `ansible-test sanity` with ansible-core 2.17, 2.18 and 2.19.
-- **Integration**: `tests/integration/run.sh` starts a throwaway PKI Manager (backend image + Cosmian KMS, OIDC off), runs `tests/integration/module.yml` (the module against the real API, with asserts), then runs both roles twice on an Ubuntu 24.04 container. The second run must report `changed=0`.
+- **Integration**: `tests/integration/run.sh` starts a throwaway PKI Manager 4 (backend image + OpenBao, the PKI Manager fork; no Cosmian KMS; OIDC off), runs `tests/integration/module.yml` (the module against the real API, with asserts), then runs both roles twice on an Ubuntu 24.04 container. The second run must report `changed=0`.
 
-Run the integration tests locally (needs Docker, ansible-core, `community.crypto` and `community.docker`):
+Run the integration tests locally (needs Docker, git, ansible-core, `community.crypto` and `community.docker`):
 
 ```bash
-tests/integration/run.sh                               # PKI Manager 3.19.0 on 127.0.0.1:3000
-PKI_IMAGE_TAG=3.19.1 PKI_PORT=47500 tests/integration/run.sh
+tests/integration/run.sh                               # PKI Manager 4.0.0 on 127.0.0.1:3000
+PKI_IMAGE_TAG=4.0.1 PKI_PORT=47500 tests/integration/run.sh
 KEEP=1 tests/integration/run.sh                        # leave the stack up to debug
+# a local backend build and a pki-manager-web checkout, before a release:
+PKI_IMAGE=pki-manager-backend:dev PKI_WEB_DIR=../pki-manager-web tests/integration/run.sh
 ```
+
+The OpenBao server config, policies, bootstrap script and pinned fork image come from the `openbao/` folder of the PKI Manager release under test (`v$PKI_IMAGE_TAG` on GitHub, or `PKI_WEB_DIR`). The bootstrap gives the backend a scoped token (policies `pki-manager-backend` and `pki-manager-ra` only). The run checks that this token cannot read `sys/mounts`, and that the keys of the run are in the Transit mount `pki-manager`. PKI Manager 3.x keeps its keys in Cosmian KMS: this stack does not run it, and collection 3.1.0 was the last version tested against 3.x.
 
 `tests/test_role_syntax.yml` is an offline `--check` run of the role structure.
 
