@@ -14,9 +14,11 @@
       rate_limit_retries: 3
   tasks:
     # Once: a var with lookup('pipe', ...) is evaluated again at each use.
-    - name: Run id
+    - name: Run id and a random PKCS#12 password (set once)
       ansible.builtin.set_fact:
         run_id: "{{ lookup('pipe', 'date +%s') }}"
+        p12_password: "{{ lookup('ansible.builtin.password', '/dev/null', length=24, chars=['ascii_letters', 'digits']) }}"
+      no_log: true
     - name: Work directory
       ansible.builtin.file:
         path: "{{ work_dir }}"
@@ -148,11 +150,13 @@
         action: cert_download
         cert_id: "{{ cert.cert_id }}"
         download_format: p12
-        download_password: It-Pass-123
+        download_password: "{{ p12_password }}"
         download_dest: "{{ work_dir }}/cert.p12"
       register: r
     - name: Check the PKCS#12 file
-      ansible.builtin.command: openssl pkcs12 -in {{ work_dir }}/cert.p12 -passin pass:It-Pass-123 -nokeys
+      ansible.builtin.command: openssl pkcs12 -in {{ work_dir }}/cert.p12 -passin env:P12_PASSWORD -nokeys
+      environment:
+        P12_PASSWORD: "{{ p12_password }}"
       changed_when: false
 
     - name: Find the certificate by its PEM

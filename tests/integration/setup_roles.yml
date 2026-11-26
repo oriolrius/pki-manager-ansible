@@ -54,4 +54,6 @@
         dest: "{{ work_dir }}/fixtures.yml"
         mode: "0600"
         content: "{{ {'it_ca_id': ca.ca_id, 'it_zone': zone, 'it_fleet_token': fleet.token,
-                     'it_user_ca_key': sshcas.results[0].ssh_ca.opensshPublicKey} | to_nice_yaml }}"
+                     'it_user_ca_key': sshcas.results[0].ssh_ca.opensshPublicKey,
+                     'it_p12_password': lookup('ansible.builtin.password', '/dev/null', length=24,
+                                               chars=['ascii_letters', 'digits'])} | to_nice_yaml }}"

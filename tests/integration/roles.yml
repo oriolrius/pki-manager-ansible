@@ -19,7 +19,7 @@
         dns_names: ["{{ ansible_fqdn }}", "www.{{ ansible_fqdn }}"]
       - name: app
         format: p12
-        password: It-P12-Pass
+        password: "{{ it_p12_password }}"  # random, from setup_roles.yml
     # ssh_host_cert
     ssh_ca_base_url: "{{ base_url }}"
     ssh_ca_fleet_token: "{{ it_fleet_token }}"
