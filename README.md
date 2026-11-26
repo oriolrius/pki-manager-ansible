@@ -2,9 +2,9 @@
 
 **`oriolrius.pki_manager`** — an Ansible collection for managing **both X.509 certificates and the SSH certificate workflow** through the PKI Manager REST API (one module plus two host-setup roles).
 
-- **Version:** 3.0.1 (tested against PKI Manager 3.19.0)
+- **Version:** 3.1.0 (tested against PKI Manager 3.19.0)
 - **Collection (FQCN):** `oriolrius.pki_manager`
-- **Requires:** Ansible `>=2.14.0`, `community.crypto >=2.0.0`
+- **Requires:** ansible-core `>=2.15.0` (CI tests 2.17, 2.18, 2.19), `community.crypto >=2.0.0`
 - **Repository:** https://github.com/oriolrius/pki-manager-ansible
 
 ---
@@ -354,20 +354,21 @@ Full docs: [`roles/ssh_host_cert/README.md`](roles/ssh_host_cert/README.md).
 
 ## Tests
 
+CI (`.github/workflows/ci.yml`) runs on every pull request:
+
+- **Lint**: `ansible-lint` (production profile) and `yamllint`.
+- **Sanity**: `ansible-test sanity` with ansible-core 2.17, 2.18 and 2.19.
+- **Integration**: `tests/integration/run.sh` starts a throwaway PKI Manager (backend image + Cosmian KMS, OIDC off), runs `tests/integration/module.yml` (the module against the real API, with asserts), then runs both roles twice on an Ubuntu 24.04 container. The second run must report `changed=0`.
+
+Run the integration tests locally (needs Docker, ansible-core, `community.crypto` and `community.docker`):
+
 ```bash
-export PKI_API_URL="https://pki.example.com/api/v1"
-export PKI_OIDC_URL="https://iam.example.com/realms/pki/protocol/openid-connect/token"
-export PKI_CLIENT_ID="your-client-id"
-export PKI_CLIENT_SECRET="your-client-secret"
-
-ansible-galaxy collection build
-ansible-galaxy collection install oriolrius-pki_manager-*.tar.gz --force
-
-ansible-playbook tests/test_module.yml       # X.509 CRUD/lifecycle smoke test
-ansible-playbook tests/test_ssh_module.yml   # every SSH action (unauthenticated + ECIES)
-ansible-playbook tests/test_role.yml         # pki_host_setup integration
-ansible-playbook tests/test_role_syntax.yml  # offline --check structural validation
+tests/integration/run.sh                               # PKI Manager 3.19.0 on 127.0.0.1:3000
+PKI_IMAGE_TAG=3.19.1 PKI_PORT=47500 tests/integration/run.sh
+KEEP=1 tests/integration/run.sh                        # leave the stack up to debug
 ```
+
+`tests/test_role_syntax.yml` is an offline `--check` run of the role structure.
 
 ---
 

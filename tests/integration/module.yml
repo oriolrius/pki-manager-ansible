@@ -1,0 +1,488 @@
+---
+# Integration tests of the pki_manager module against a real PKI Manager
+# (tests/integration/run.sh starts it: OIDC off, SSH CA open). Every task
+# checks the API result, not only that the call returned.
+- name: Test the pki_manager module
+  hosts: localhost
+  gather_facts: false
+  vars:
+    api_url: "{{ lookup('env', 'PKI_API_URL') | default('http://127.0.0.1:3000/api/v1', true) }}"
+    work_dir: "{{ lookup('env', 'PKI_IT_WORK') | default('/tmp/pki-ansible-it', true) }}"
+  module_defaults:
+    oriolrius.pki_manager.pki_manager:
+      api_url: "{{ api_url }}"
+      rate_limit_retries: 3
+  tasks:
+    # Once: a var with lookup('pipe', ...) is evaluated again at each use.
+    - name: Run id
+      ansible.builtin.set_fact:
+        run_id: "{{ lookup('pipe', 'date +%s') }}"
+    - name: Work directory
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: "0700"
+
+    # ------------------------------------------------------------------ basics
+    - name: Auth test (no credentials, OIDC off)
+      oriolrius.pki_manager.pki_manager:
+        action: auth_test
+      register: r
+    - name: Check auth_test
+      ansible.builtin.assert:
+        that:
+          - r.authenticated == false
+          - "'anonymous' in r.msg"
+
+    - name: Stats
+      oriolrius.pki_manager.pki_manager:
+        action: stats
+      register: r
+    - name: Check stats
+      ansible.builtin.assert:
+        that: r.stats.totalCAs is defined
+
+    # ---------------------------------------------------------------------- CA
+    - name: Create a CA with 5 years
+      oriolrius.pki_manager.pki_manager:
+        action: ca_create
+        ca_cn: "IT CA {{ run_id }}"
+        ca_org: Integration
+        ca_country: ES
+        ca_validity_years: 5
+        ca_algorithm: RSA-2048
+      register: ca
+    - name: Check the CA validity (validityYears is sent)
+      ansible.builtin.assert:
+        that:
+          - ca.changed
+          - (ca.ca.notAfter[:4] | int) - (ca.ca.notBefore[:4] | int) == 5
+
+    - name: An ECDSA CA is refused by the module
+      oriolrius.pki_manager.pki_manager:
+        action: ca_create
+        ca_cn: x
+        ca_org: x
+        ca_country: ES
+        ca_algorithm: ECDSA-P256
+      register: r
+      ignore_errors: true
+    - name: Check the ECDSA refusal
+      ansible.builtin.assert:
+        that: r is failed
+
+    - name: Get the CA
+      oriolrius.pki_manager.pki_manager:
+        action: ca_get
+        ca_id: "{{ ca.ca_id }}"
+      register: r
+    - name: Check ca_get
+      ansible.builtin.assert:
+        that: "'BEGIN CERTIFICATE' in r.ca.certificatePem"
+
+    - name: Download the CA certificate twice (idempotent)
+      oriolrius.pki_manager.pki_manager:
+        action: ca_download
+        ca_id: "{{ ca.ca_id }}"
+        download_dest: "{{ work_dir }}/ca.pem"
+      register: dl
+      loop: [1, 2]
+    - name: Check ca_download
+      ansible.builtin.assert:
+        that:
+          - dl.results[0].changed
+          - not dl.results[1].changed
+          - "'BEGIN CERTIFICATE' in lookup('file', work_dir + '/ca.pem')"
+
+    # ------------------------------------------------------------- certificate
+    - name: Issue a server certificate
+      oriolrius.pki_manager.pki_manager:
+        action: cert_issue
+        ca_id: "{{ ca.ca_id }}"
+        cert_cn: "web-{{ run_id }}.example.test"
+        cert_org: Integration
+        cert_country: ES
+        cert_dns_names: ["web-{{ run_id }}.example.test"]
+        cert_validity: 90
+        tags: [it]
+      register: cert
+    - name: Check cert_issue
+      ansible.builtin.assert:
+        that: cert.changed and cert.certificate.status == 'active'
+
+    - name: Issue without cert_org is refused before the request
+      oriolrius.pki_manager.pki_manager:
+        action: cert_issue
+        ca_id: "{{ ca.ca_id }}"
+        cert_cn: "x.example.test"
+      register: r
+      ignore_errors: true
+    - name: Check the refusal
+      ansible.builtin.assert:
+        that: r is failed and 'cert_org' in r.msg
+
+    - name: List the server certificates of the CA
+      oriolrius.pki_manager.pki_manager:
+        action: cert_list
+        ca_id: "{{ ca.ca_id }}"
+        cert_type: server
+        cert_status: active
+      register: r
+    - name: Check cert_list
+      ansible.builtin.assert:
+        that: r.cert_count == 1 and r.certificates | length == 1
+
+    - name: Download the certificate as PEM twice (idempotent)
+      oriolrius.pki_manager.pki_manager:
+        action: cert_download
+        cert_id: "{{ cert.cert_id }}"
+        download_dest: "{{ work_dir }}/cert.pem"
+      register: dl
+      loop: [1, 2]
+    - name: Check cert_download
+      ansible.builtin.assert:
+        that: dl.results[0].changed and not dl.results[1].changed
+
+    - name: Download as PKCS#12 (password in the header)
+      oriolrius.pki_manager.pki_manager:
+        action: cert_download
+        cert_id: "{{ cert.cert_id }}"
+        download_format: p12
+        download_password: It-Pass-123
+        download_dest: "{{ work_dir }}/cert.p12"
+      register: r
+    - name: Check the PKCS#12 file
+      ansible.builtin.command: openssl pkcs12 -in {{ work_dir }}/cert.p12 -passin pass:It-Pass-123 -nokeys
+      changed_when: false
+
+    - name: Find the certificate by its PEM
+      oriolrius.pki_manager.pki_manager:
+        action: cert_find
+        cert_pem: "{{ lookup('file', work_dir + '/cert.pem') }}"
+      register: r
+    - name: Check cert_find
+      ansible.builtin.assert:
+        that: r.cert_id == cert.cert_id
+
+    - name: Renew with the same key and revoke the original
+      oriolrius.pki_manager.pki_manager:
+        action: cert_renew
+        cert_id: "{{ cert.cert_id }}"
+        cert_validity: 60
+        renew_new_key: false
+        revoke_original: true
+      register: renewed
+    - name: Get the original
+      oriolrius.pki_manager.pki_manager:
+        action: cert_get
+        cert_id: "{{ cert.cert_id }}"
+      register: original
+    - name: Check the renewal
+      ansible.builtin.assert:
+        that:
+          - renewed.new_cert_id != cert.cert_id
+          - original.certificate.status == 'revoked'
+
+    - name: An active certificate cannot be deleted (409, not a failure)
+      oriolrius.pki_manager.pki_manager:
+        action: cert_delete
+        cert_id: "{{ renewed.new_cert_id }}"
+      register: r
+    - name: Check the 409 mapping
+      ansible.builtin.assert:
+        that: r is not failed and not r.changed and 'cannot be deleted yet' in r.msg
+
+    - name: Revoke with details and a new CRL
+      oriolrius.pki_manager.pki_manager:
+        action: cert_revoke
+        cert_id: "{{ renewed.new_cert_id }}"
+        revocation_reason: superseded
+        revocation_details: integration test
+        generate_crl: true
+      register: r
+    - name: Check cert_revoke
+      ansible.builtin.assert:
+        that: r.changed
+
+    # --------------------------------------------------------------- bulk, CRL
+    - name: Issue two certificates for the bulk actions
+      oriolrius.pki_manager.pki_manager:
+        action: cert_issue
+        ca_id: "{{ ca.ca_id }}"
+        cert_cn: "bulk{{ item }}-{{ run_id }}.example.test"
+        cert_org: Integration
+        cert_country: ES
+        cert_dns_names: ["bulk{{ item }}-{{ run_id }}.example.test"]
+        cert_validity: 30
+      loop: [1, 2]
+      register: bulk_certs
+    - name: Bulk revoke
+      oriolrius.pki_manager.pki_manager:
+        action: cert_bulk_revoke
+        cert_ids: "{{ bulk_certs.results | map(attribute='cert_id') | list }}"
+        revocation_reason: cessationOfOperation
+      register: r
+    - name: Check the bulk revoke
+      ansible.builtin.assert:
+        that: r.bulk.successful == 2 and r.bulk.failed == 0
+    - name: Bulk delete (revoked certificates with no renewal)
+      oriolrius.pki_manager.pki_manager:
+        action: cert_bulk_delete
+        cert_ids: "{{ bulk_certs.results | map(attribute='cert_id') | list }}"
+        destroy_key: true
+      register: r
+    - name: Check the bulk delete
+      ansible.builtin.assert:
+        that: r.bulk.successful == 2
+
+    - name: Generate a CRL
+      oriolrius.pki_manager.pki_manager:
+        action: crl_generate
+        ca_id: "{{ ca.ca_id }}"
+        crl_next_update_days: 3
+      register: r
+    - name: List the CRLs
+      oriolrius.pki_manager.pki_manager:
+        action: crl_list
+        ca_id: "{{ ca.ca_id }}"
+      register: crls
+    - name: Download the CRL (public route)
+      oriolrius.pki_manager.pki_manager:
+        action: crl_download
+        ca_id: "{{ ca.ca_id }}"
+        download_dest: "{{ work_dir }}/ca.crl"
+      register: r
+    - name: Check the CRL
+      ansible.builtin.command: openssl crl -in {{ work_dir }}/ca.crl -noout -nextupdate
+      changed_when: false
+    - name: Check crl_list
+      ansible.builtin.assert:
+        that: crls.total >= 2
+
+    # ------------------------------------------------- search, audit, reports
+    - name: Search
+      oriolrius.pki_manager.pki_manager:
+        action: search
+        search_query: "web-{{ run_id }}"
+      register: r
+    - name: Check search
+      ansible.builtin.assert:
+        that: r.total_count >= 1
+    - name: Audit log
+      oriolrius.pki_manager.pki_manager:
+        action: audit_list
+        audit_operation: ca.create
+        audit_limit: 5
+      register: r
+    - name: Check audit_list
+      ansible.builtin.assert:
+        that: r.audit['items'] | length >= 1
+    - name: Report
+      oriolrius.pki_manager.pki_manager:
+        action: report_generate
+        report_type: certificate_inventory
+        ca_id: "{{ ca.ca_id }}"
+        download_dest: "{{ work_dir }}/inventory.csv"
+      register: r
+    - name: Check the report
+      ansible.builtin.assert:
+        that: "'Certificate Inventory' in lookup('file', work_dir + '/inventory.csv')"
+    - name: Domains
+      oriolrius.pki_manager.pki_manager:
+        action: domain_list
+        search_query: "web-{{ run_id }}"
+      register: r
+    - name: Check domain_list
+      ansible.builtin.assert:
+        that: r.total >= 1
+
+    # -------------------------------------------------------------------- SSH
+    - name: Create two SSH zones
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_zone_create
+        zone: "{{ item }}-{{ run_id }}"
+      loop: [za, zb]
+    - name: Create a zone again (no change)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_zone_create
+        zone: "za-{{ run_id }}"
+      register: r
+    - name: Check zone idempotency
+      ansible.builtin.assert:
+        that: not r.changed
+
+    - name: Create a user CA and a host CA in zone za
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_ca_create
+        ssh_ca_type: "{{ item }}"
+        ssh_ca_label: "it-{{ item }}"
+        zone: "za-{{ run_id }}"
+      loop: [user, host]
+      register: sshcas
+    - name: An identity without zone is refused (several zones)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_identity_create
+        identity_subject: "nozone-{{ run_id }}"
+      register: r
+      ignore_errors: true
+    - name: Check the fail-closed zone
+      ansible.builtin.assert:
+        that: r is failed and 'zone' in r.msg
+
+    - name: Identity, principal, grant in zone za
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_identity_create
+        identity_subject: "alice-{{ run_id }}"
+        zone: "za-{{ run_id }}"
+      register: ident
+    - name: Principal
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_create
+        principal_name: "deploy-{{ run_id }}"
+        zone: "za-{{ run_id }}"
+      register: princ
+    - name: Grant
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_grant
+        identity_id: "{{ ident.identity_id }}"
+        principal_id: "{{ princ.principal_id }}"
+
+    - name: Fleet token for the host CA of zone za
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_token_mint
+        token_name: "it-fleet-{{ run_id }}"
+        host_ca_id: "{{ sshcas.results[1].ca_id }}"
+        token_ops: [sign-host, get-principals]
+        zone: "za-{{ run_id }}"
+      register: fleet
+
+    - name: Host key
+      community.crypto.openssh_keypair:
+        path: "{{ work_dir }}/host_key"
+        type: ecdsa
+        size: 256
+    - name: Sign the host (fleet token)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_sign_host
+        host_fqdn: "h1-{{ run_id }}.example.test"
+        host_pubkey: "{{ lookup('file', work_dir + '/host_key.pub') }}"
+        fleet_token: "{{ fleet.token }}"
+        host_valid_seconds: 86400
+        idempotency_key: "it-{{ run_id }}"
+      register: signed
+    - name: Map the principal on the host
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principal_map
+        host_id: "{{ signed.host_id }}"
+        principal_id: "{{ princ.principal_id }}"
+        local_account: deploy
+    - name: Get the principals (fleet token)
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_get_principals
+        host_fqdn: "h1-{{ run_id }}.example.test"
+        fleet_token: "{{ fleet.token }}"
+      register: princs
+    - name: Acknowledge the principal push
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_principals_pushed
+        host_fqdn: "h1-{{ run_id }}.example.test"
+        fleet_token: "{{ fleet.token }}"
+        principals_sha256: "{{ princs.auth_principals.sha256 }}"
+      register: pushed
+    - name: Check the host flow
+      ansible.builtin.assert:
+        that:
+          - signed.cert_openssh is match('ecdsa-sha2-nistp256-cert-v01@openssh.com ')
+          - "'deploy' in princs.auth_principals.files"
+          - pushed.changed
+
+    - name: User key
+      community.crypto.openssh_keypair:
+        path: "{{ work_dir }}/user_key"
+        type: ed25519
+    - name: User certificate with extensions and a source address
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_user_issue
+        identity_id: "{{ ident.identity_id }}"
+        ssh_public_key: "{{ lookup('file', work_dir + '/user_key.pub') }}"
+        principals: ["deploy-{{ run_id }}"]
+        user_valid_seconds: 600
+        user_extensions: [permit-pty]
+        source_address: 10.0.0.0/8
+        user_key_id: "it-{{ run_id }}"
+      register: ucert
+    - name: Save the user certificate
+      ansible.builtin.copy:
+        content: "{{ ucert.cert_openssh }}\n"
+        dest: "{{ work_dir }}/user_key-cert.pub"
+        mode: "0600"
+    - name: Read the user certificate
+      ansible.builtin.command: ssh-keygen -L -f {{ work_dir }}/user_key-cert.pub
+      register: keygen
+      changed_when: false
+    - name: Check the user certificate
+      ansible.builtin.assert:
+        that:
+          - "'it-' + run_id in keygen.stdout"
+          - "'source-address 10.0.0.0/8' in keygen.stdout"
+          - "'permit-pty' in keygen.stdout"
+
+    - name: Trust anchors of zone za and of the default zone
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_trusted_user_ca
+        zone: "{{ item }}"
+      loop: ["za-{{ run_id }}", default]
+      register: trust
+    - name: Check per-zone trust
+      ansible.builtin.assert:
+        that:
+          - trust.results[0].trusted_user_ca_keys != trust.results[1].trusted_user_ca_keys
+          - sshcas.results[0].ssh_ca.opensshPublicKey | trim in trust.results[0].trusted_user_ca_keys
+
+    - name: Metrics and trust anchors (named actions)
+      oriolrius.pki_manager.pki_manager:
+        action: "{{ item }}"
+        zone: "za-{{ run_id }}"
+      loop: [ssh_metrics, ssh_trust_anchors]
+    - name: Generic api_request
+      oriolrius.pki_manager.pki_manager:
+        action: api_request
+        api_path: "/ssh/hosts/{{ signed.host_id }}/access"
+      register: r
+    - name: Check api_request
+      ansible.builtin.assert:
+        that: r.status == 200 and not r.changed
+
+    - name: Lifecycle - revoke the fleet token, offboard host and identity
+      oriolrius.pki_manager.pki_manager:
+        action: "{{ item.action }}"
+        token_id: "{{ fleet.ssh_token.id }}"
+        host_id: "{{ signed.host_id }}"
+        identity_id: "{{ ident.identity_id }}"
+        ssh_reason: integration test
+      loop:
+        - {action: ssh_token_revoke}
+        - {action: ssh_host_offboard}
+        - {action: ssh_identity_offboard}
+      loop_control:
+        label: "{{ item.action }}"
+    - name: Archive and reactivate zone zb
+      oriolrius.pki_manager.pki_manager:
+        action: "{{ item }}"
+        zone: "zb-{{ run_id }}"
+      loop: [ssh_zone_archive, ssh_zone_unarchive]
+
+    - name: Check mode does not change the server
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_zone_archive
+        zone: "zb-{{ run_id }}"
+      check_mode: true
+      register: r
+    - name: Read zone zb
+      oriolrius.pki_manager.pki_manager:
+        action: api_request
+        api_path: "/ssh/zones/zb-{{ run_id }}"
+      register: zb
+    - name: Check check mode
+      ansible.builtin.assert:
+        that: r.changed and zb.json.status == 'active'

@@ -732,6 +732,7 @@ import os
 import time
 import base64
 import hashlib
+import pwd
 import tempfile
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.urls import open_url
@@ -747,7 +748,11 @@ def default_token_cache_path(api_url, oidc_url, client_id):
     """Per-user cache file whose name is bound to the server and the client."""
     key = '|'.join([api_url or '', oidc_url or '', client_id or ''])
     digest = hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]
-    base = os.path.join(os.path.expanduser('~'), '.cache', 'pki-manager-ansible')
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:
+        home = os.environ.get('HOME') or tempfile.gettempdir()
+    base = os.path.join(home, '.cache', 'pki-manager-ansible')
     return os.path.join(base, 'token-%s.json' % digest)
 
 
@@ -1961,7 +1966,7 @@ def run_module():
         ssh_ca_type=dict(type='str', choices=['user', 'host']),
         ssh_ca_label=dict(type='str'),
         token_name=dict(type='str'),
-        token_ops=dict(type='list', elements='str'),
+        token_ops=dict(type='list', elements='str', no_log=False),
         host_ca_id=dict(type='str'),
         user_ca_id=dict(type='str'),
         identity_id=dict(type='str'),
@@ -1993,7 +1998,7 @@ def run_module():
         enforce_entitlement=dict(type='bool'),
         cert_authority_pattern=dict(type='str', default='*'),
         block_reason=dict(type='str'),
-        idempotency_key=dict(type='str'),
+        idempotency_key=dict(type='str', no_log=False),
         fleet_token=dict(type='str', no_log=True),
         zone=dict(type='str'),
         cert_ids=dict(type='list', elements='str'),

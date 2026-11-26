@@ -1,0 +1,53 @@
+---
+# Both roles against an Ubuntu 24.04 container (run.sh starts it). run.sh runs
+# this playbook twice: the second run must change nothing.
+- name: Run the roles on the test host
+  hosts: target
+  gather_facts: true
+  vars_files:
+    - "{{ lookup('env', 'PKI_IT_WORK') }}/fixtures.yml"
+  vars:
+    base_url: "{{ lookup('env', 'PKI_BASE_URL') | default('http://127.0.0.1:3000', true) }}"
+    # pki_host_setup
+    pki_api_url: "{{ base_url }}/api/v1"
+    pki_api_token: oidc-is-off   # the test server has no OIDC; the role needs a credential
+    pki_ca_id: "{{ it_ca_id }}"
+    pki_cert_org: Integration
+    pki_cert_country: ES
+    pki_certificates:
+      - name: web
+        dns_names: ["{{ ansible_fqdn }}", "www.{{ ansible_fqdn }}"]
+      - name: app
+        format: p12
+        password: It-P12-Pass
+    # ssh_host_cert
+    ssh_ca_base_url: "{{ base_url }}"
+    ssh_ca_fleet_token: "{{ it_fleet_token }}"
+    ssh_host_cert_zone: "{{ it_zone }}"
+    ssh_host_cert_reload_method: command
+    ssh_host_cert_scheduler: cron
+    ssh_host_cert_renew_enabled: true
+  roles:
+    - oriolrius.pki_manager.pki_host_setup
+    - oriolrius.pki_manager.ssh_host_cert
+  post_tasks:
+    - name: Read the installed files
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - /etc/ssl/certs/web-fullchain.crt
+        - /etc/ssh/ssh-user-ca.pub
+        - /etc/ssh/ssh_host_ecdsa_key-cert.pub
+      register: files
+    - name: Check the installed files
+      ansible.builtin.assert:
+        that:
+          # The fullchain file never has the private key (fixed in 3.0.1).
+          - "'PRIVATE KEY' not in (files.results[0].content | b64decode)"
+          - (files.results[0].content | b64decode).count('BEGIN CERTIFICATE') == 2
+          # The trust anchor is the user CA of the token's zone, not the default zone.
+          - it_user_ca_key | trim in (files.results[1].content | b64decode)
+          - (files.results[2].content | b64decode) is match('ecdsa-sha2-nistp256-cert-v01@openssh.com ')
+    - name: Check the certificate chain
+      ansible.builtin.command: openssl verify -CAfile /etc/ssl/certs/web-chain.crt /etc/ssl/certs/web-fullchain.crt
+      changed_when: false

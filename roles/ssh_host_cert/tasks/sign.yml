@@ -11,7 +11,7 @@
     fleet_token: "{{ ssh_ca_fleet_token }}"
     host_fqdn: "{{ ansible_fqdn }}"
     host_pubkey: "{{ ssh_host_cert_keydata.public_key }}"
-    host_addresses: "{{ ansible_all_ipv4_addresses }}"
+    host_addresses: "{{ ansible_all_ipv4_addresses | default([]) }}"
     idempotency_key: "{{ inventory_hostname }}-{{ ssh_host_cert_keydata.fingerprint }}"
   register: ssh_host_cert_signed
   delegate_to: localhost

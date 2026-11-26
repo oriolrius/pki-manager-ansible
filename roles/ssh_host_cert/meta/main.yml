@@ -8,7 +8,7 @@ galaxy_info:
     sshd drop-in, unattended renewal, and a KRL revocation channel (public cron
     or encrypted krl-client).
   license: MIT
-  min_ansible_version: "2.14"
+  min_ansible_version: "2.15"
   platforms:
     - name: Ubuntu
       versions: [jammy, noble]

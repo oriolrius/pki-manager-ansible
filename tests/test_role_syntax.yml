@@ -7,9 +7,6 @@
 - name: Test role syntax and variable handling
   hosts: localhost
   gather_facts: true
-  collections:
-    - oriolrius.pki_manager
-
   vars:
     # Mock PKI configuration
     pki_api_url: "https://pki.example.com/api/v1"

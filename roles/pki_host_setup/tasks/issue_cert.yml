@@ -17,7 +17,10 @@
       {{ cert_config.dns_names
          | default([ansible_fqdn | default(''), ansible_hostname | default('')]
                    | select('search', '\.') | unique | list) }}
-    _cert_ip_addresses: "{{ cert_config.ip_addresses | default([ansible_default_ipv4.address] if ansible_default_ipv4.address is defined else []) }}"
+    # A minimal host (no "ip" command) has no ansible_default_ipv4 fact.
+    _cert_ip_addresses: >-
+      {{ cert_config.ip_addresses
+         | default([(ansible_default_ipv4 | default({})).get('address')] | select | list) }}
     _cert_validity: "{{ cert_config.validity | default(pki_cert_validity) }}"
     _cert_algorithm: "{{ cert_config.algorithm | default(pki_cert_algorithm) }}"
     _cert_org: "{{ cert_config.org | default(pki_cert_org) }}"
@@ -216,21 +219,27 @@
           loop_control:
             label: "{{ item.dest }}"
 
-        - name: "Install the chain and fullchain files: {{ _cert_name }}"
+        # chain = the issuing CA; fullchain = certificate + issuing CA (no key).
+        # No loop here: Ansible renders a loop list before "when", and a
+        # PKCS#12 entry has no PEM file for the lookup.
+        - name: "Install the chain file: {{ _cert_name }}"
           ansible.builtin.copy:
-            content: "{{ item.content }}"
-            dest: "{{ item.dest }}"
+            content: |
+              {{ _pki_ca_info.ca.certificatePem | trim }}
+            dest: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
             owner: "{{ _cert_owner }}"
             group: "{{ _cert_group }}"
             mode: "0644"
-          loop:
-            # chain = the issuing CA; fullchain = certificate + issuing CA (no key).
-            - dest: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
-              content: "{{ _pki_ca_info.ca.certificatePem | trim }}\n"
-            - dest: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}"
-              content: "{{ lookup('ansible.builtin.file', _cert_tmp.path + '/pem') | trim }}\n{{ _pki_ca_info.ca.certificatePem | trim }}\n"
-          loop_control:
-            label: "{{ item.dest }}"
+
+        - name: "Install the fullchain file: {{ _cert_name }}"
+          ansible.builtin.copy:
+            content: |
+              {{ lookup('ansible.builtin.file', _cert_tmp.path + '/pem') | trim }}
+              {{ _pki_ca_info.ca.certificatePem | trim }}
+            dest: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}"
+            owner: "{{ _cert_owner }}"
+            group: "{{ _cert_group }}"
+            mode: "0644"
 
     - name: Download and install the PKCS#12 file
       when: _cert_format in ['p12', 'pfx']

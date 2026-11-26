@@ -1,7 +1,7 @@
 ---
 namespace: oriolrius
 name: pki_manager
-version: 3.0.1
+version: 3.1.0
 readme: README.md
 authors:
   - Oriol Rius <oriol@joor.net>
@@ -34,3 +34,4 @@ build_ignore:
   - .codegraph
   - "**/__pycache__"
   - "*.pyc"
+  - .ansible
