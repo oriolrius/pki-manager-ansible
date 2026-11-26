@@ -2,7 +2,7 @@
 
 **`oriolrius.pki_manager`** — an Ansible collection for managing **both X.509 certificates and the SSH certificate workflow** through the PKI Manager REST API (one module plus two host-setup roles).
 
-- **Version:** 2.3.0
+- **Version:** 3.0.0 (tested against PKI Manager 3.19.0)
 - **Collection (FQCN):** `oriolrius.pki_manager`
 - **Requires:** Ansible `>=2.14.0`, `community.crypto >=2.0.0`
 - **Repository:** https://github.com/oriolrius/pki-manager-ansible
@@ -65,7 +65,7 @@ ansible-galaxy collection install oriolrius.pki_manager
 # requirements.yml
 collections:
   - name: oriolrius.pki_manager
-    version: ">=2.3.0"
+    version: ">=3.0.0"
 ```
 
 ```bash
@@ -77,7 +77,7 @@ The `community.crypto >=2.0.0` dependency is resolved automatically from the col
 ### From GitHub
 
 ```bash
-ansible-galaxy collection install git+https://github.com/oriolrius/pki-manager-ansible.git,v2.3.0
+ansible-galaxy collection install git+https://github.com/oriolrius/pki-manager-ansible.git,v3.0.0
 ```
 
 ---
@@ -201,7 +201,7 @@ The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
 | `ssh_cert_authority` | Fetch `@cert-authority` known_hosts line | `cert_authority_pattern` |
 | `ssh_trusted_user_ca` | Fetch `TrustedUserCAKeys` content | — |
 | `ssh_host_ca` | Fetch host-CA trust anchor | — |
-| `ssh_sign_host` | Sign host cert (fleet-token) | `host_fqdn`, `host_pubkey`, `fleet_token`, `user_valid_seconds`, `idempotency_key` |
+| `ssh_sign_host` | Sign host cert (fleet-token) | `host_fqdn`, `host_pubkey`, `fleet_token`, `host_valid_seconds`, `host_key_id`, `idempotency_key` |
 | `ssh_register_host_pubkey` | Register ECIES host key (fleet-token) | `host_fqdn`, `fleet_token` |
 | `ssh_get_principals` | Fetch host `auth_principals` (fleet-token) | `host_fqdn`, `fleet_token` |
 | `ssh_principals_pushed` | Acknowledge the installed principal files so the host is not Stale (fleet-token; 409 `SHA256_MISMATCH` fails with `sha256_mismatch`/`current_sha256`; no-op in check mode) | `host_fqdn`, `fleet_token`, `principals_sha256` |
@@ -221,21 +221,24 @@ X.509 and SSH-admin actions hit `{api_url}/…` with the optional OIDC Bearer. H
 | `oidc_url` | No | — | OIDC token endpoint (omit when OIDC is disabled) |
 | `client_id` | No | — | OIDC client ID |
 | `client_secret` | No | — | OIDC client secret (`no_log`) |
+| `api_token` | No | — | A bearer token you got before (`no_log`); the module then skips the OIDC login |
 | `validate_certs` | No | `true` | Verify the PKI Manager TLS certificate |
+| `ca_path` | No | — | PEM bundle to trust a server with a private CA (use it instead of `validate_certs: false`) |
 | `timeout` | No | `30` | Request timeout (seconds) |
-| `token_cache_path` | No | `/tmp/.pki_token_cache` | OIDC token cache (60 s expiry buffer, `chmod 0600`) |
+| `token_cache_path` | No | `~/.cache/pki-manager-ansible/token-<hash>.json` | OIDC token cache. The default name comes from `api_url`, `oidc_url` and `client_id`, so two servers or clients never share a token. The file is mode 0600 in a 0700 directory; the module ignores a cache file that another user owns, that others can read, or that was written for another server or client. A cached token that the server refuses (401) is dropped and the module logs in again once. |
 | `fleet_token` | No | — | `pkimg_…` bearer (`no_log`) for host-facing SSH actions |
 
-When `oidc_url`/`client_id`/`client_secret` are absent, the module authenticates as unauthenticated — suitable for a backend with `ALLOW_UNAUTHENTICATED_SSH_CA=true`.
+When `api_token` and `oidc_url`/`client_id`/`client_secret` are absent, the module sends unauthenticated requests — suitable for a backend with OIDC disabled. `auth_test` calls an endpoint that needs authentication, so it fails on a bad token.
 
 ### Per-domain parameters
 
-- **X.509 CA** — `ca_id`, `ca_cn`/`ca_org`/`ca_country` (required for `ca_create`), optional `ca_ou`/`ca_state`/`ca_locality`, `ca_algorithm` (`RSA-2048|RSA-4096|ECDSA-P256|ECDSA-P384`, default `RSA-4096`), `ca_validity` (days, default `3650`).
-- **X.509 certificate** — `cert_id`, `cert_cn` (required for `cert_issue`), optional `cert_org`/`cert_country`/`cert_ou`/`cert_state`/`cert_locality`, `cert_type` (default `server`), `cert_algorithm` (default `RSA-2048`), `cert_validity` (days, default `365`), SAN lists `cert_dns_names`/`cert_ip_addresses`/`cert_emails`.
-- **Downloads** — `download_format` (default `pem`): `pem`, `der`, `chain-pem`, `full-pem`, `full-der`, `key-pem`, `key-der`, `csr-pem`, `p12`, `pfx`, `pkcs8-pem`, `pkcs8-der`, `pkcs8-encrypted`, `jks-keystore`, `jks-truststore`. `download_password` is required for `p12`/`pfx`/`jks-keystore`/`jks-truststore`/`pkcs8-encrypted`. `download_dest` is written `chmod 0600`; if omitted, content is returned base64-encoded.
-- **Revocation** — `revocation_reason` (shared by `ca_revoke` and `cert_revoke`): `unspecified` (default), `keyCompromise`, `caCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`, `privilegeWithdrawn`, `aaCompromise`.
+- **X.509 CA** — `ca_id`, `ca_cn`/`ca_org`/`ca_country` (required for `ca_create`), optional `ca_ou`/`ca_state`/`ca_locality`, `ca_algorithm` (`RSA-2048|RSA-4096`, default `RSA-4096`; the API takes only RSA for a CA), `ca_validity_years` (1-30; server default 20). `ca_validity` (days) is deprecated: the module rounds it to years.
+- **X.509 certificate** — `cert_id`, `cert_cn`, `cert_org` and `cert_country` (required for `cert_issue`), optional `cert_ou`/`cert_state`/`cert_locality`, `cert_type` (default `server` for `cert_issue`; a filter for `cert_list`), `cert_status` (filter for `cert_list`), `cert_algorithm` (default `RSA-2048`), `cert_validity` (days, default `365`), SAN lists `cert_dns_names`/`cert_ip_addresses`/`cert_emails`.
+- **Downloads** — `download_format` (default `pem`): `pem`, `der`, `chain-pem`, `full-pem`, `full-der`, `key-pem`, `key-der`, `csr-pem`, `p12`, `pfx`, `pkcs8-pem`, `pkcs8-der`, `pkcs8-encrypted`, `jks-keystore`, `jks-truststore`. `download_password` is required for `p12`/`pfx`/`jks-keystore`/`jks-truststore`/`pkcs8-encrypted`. The password goes in the `X-Export-Password` header, never in the URL. `download_dest` is written `chmod 0600`; if omitted, content is returned base64-encoded. The REST `chain-pem` format returns only the certificate (server bug); `full-pem` has the certificate and the CA.
+- **Revocation** — `revocation_reason` (shared by `ca_revoke` and `cert_revoke`): `unspecified` (default), `keyCompromise`, `caCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`.
+- **Lists** — `ca_list` and `cert_list` read every page, so `cas`/`certificates` hold all items (not only the first 50).
 - **Search / dashboards** — `search_query` (required for `search`), `search_limit` (default `10`), `expiring_limit` (default `5`, capped at `20`).
-- **SSH** — `ssh_ca_type` (`user|host`), `ssh_ca_label`; `token_name`, `token_ops` (e.g. `sign-host`/`get-principals`/`register-host-pubkey`), `host_ca_id`/`user_ca_id`; `identity_id`/`identity_subject`/`identity_email`; `principal_id`/`principal_name`/`principal_description`; `host_id`/`host_fqdn`/`host_pubkey`/`host_addresses`/`local_account`; `ssh_public_key`, `principals`, `user_valid_seconds` (sent as the `validForSeconds` API payload field; used by both `ssh_user_issue` and `ssh_sign_host`), `enforce_entitlement`; `cert_authority_pattern` (default `*`), `block_reason`, `idempotency_key` (`Idempotency-Key` header for `ssh_sign_host`).
+- **SSH** — `ssh_ca_type` (`user|host`), `ssh_ca_label`; `token_name`, `token_ops` (e.g. `sign-host`/`get-principals`/`register-host-pubkey`), `host_ca_id`/`user_ca_id`; `identity_id`/`identity_subject`/`identity_email`/`identity_external_subject`; `principal_id`/`principal_name`/`principal_description`; `host_id`/`host_fqdn`/`host_pubkey`/`host_addresses`/`local_account`; `ssh_public_key`, `principals`, `user_valid_seconds` (`validForSeconds` of `ssh_user_issue`), `host_valid_seconds` and `host_key_id` (`ssh_sign_host`; `user_valid_seconds` is still accepted there when `host_valid_seconds` is not set), `enforce_entitlement`; `cert_authority_pattern` (default `*`), `block_reason`, `idempotency_key` (`Idempotency-Key` header for `ssh_sign_host`).
 
 ---
 
@@ -243,13 +246,15 @@ When `oidc_url`/`client_id`/`client_secret` are absent, the module authenticates
 
 ### `pki_host_setup` — X.509 host certificates
 
-Provisions Ubuntu hosts with X.509 certificates issued from the PKI Manager REST API. In one run it authenticates via OIDC client credentials, issues one or more certs from a chosen CA (CN auto-derived from the hostname/FQDN, configurable DNS+IP SANs, per-cert type/validity/format), installs them to standard Ubuntu locations with correct permissions (certs `0644 root:root`, keys `0640 root:ssl-cert`), optionally installs the CA into the system trust store, supports PEM and PKCS12/PFX output, and fires handler notifications (e.g. reload nginx) on change. Exports `pki_issued_certificates` with per-cert id/CN/paths.
+Provisions Ubuntu hosts with X.509 certificates issued from the PKI Manager REST API. All API calls run on the controller (`delegate_to: localhost`), so the OIDC secret and tokens never reach the managed hosts. The role is idempotent: a state file per certificate (`pki_state_dir`) records the certificate id, a hash of the request and `notAfter`, and a new certificate is issued only when the request changes, a file is missing, the certificate expires within `pki_cert_renew_before_days` (default 30), or `force: true` is set. The replaced certificate is revoked (`superseded`) unless `pki_revoke_replaced: false`. It issues one or more certs from a chosen CA (CN auto-derived from the hostname/FQDN, configurable DNS+IP SANs, per-cert type/validity/format), installs them to standard Ubuntu locations with correct permissions (certs `0644 root:root`, keys `0640 root:ssl-cert`), optionally installs the CA into the system trust store, supports PEM and PKCS12/PFX output, and fires handler notifications (e.g. reload nginx) on change. Exports `pki_issued_certificates` with per-cert id/CN/paths.
 
 | Variable | Default | Notes |
 |---|---|---|
 | `pki_api_url` | `""` | **Required** — REST base, e.g. `https://pki.example.com/api/v1` |
-| `pki_oidc_url` | `""` | **Required** — OIDC token endpoint |
-| `pki_client_id` / `pki_client_secret` | `""` | **Required** — OIDC credentials |
+| `pki_oidc_url` | `""` | OIDC token endpoint (with `pki_client_id` / `pki_client_secret`) |
+| `pki_client_id` / `pki_client_secret` | `""` | OIDC credentials — set these three, or `pki_api_token` |
+| `pki_api_token` | `""` | A bearer token you got before, instead of the OIDC credentials |
+| `pki_ca_path` | `""` | PEM bundle on the controller to trust a private-CA server |
 | `pki_ca_id` | `""` | **Required** — issuing CA id |
 | `pki_certificates` | `[]` | Certs to issue/install (`name`, `cn`, `type`, `dns_names`, `ip_addresses`, `validity`, `format`, `password`, `*_filename`, `owner`, `group`, `key_group`, `notify`) |
 | `pki_cert_org` / `pki_cert_country` | `""` | Subject O and C (2-letter); required by API |
@@ -257,6 +262,12 @@ Provisions Ubuntu hosts with X.509 certificates issued from the PKI Manager REST
 | `pki_install_ca_trust` | `true` | Install CA into `/usr/local/share/ca-certificates` |
 | `pki_cert_dir` / `pki_key_dir` / `pki_ca_trust_dir` | `/etc/ssl/certs` / `/etc/ssl/private` / `/usr/local/share/ca-certificates` | Install locations |
 | `pki_cert_validity` / `pki_cert_algorithm` | `365` / `RSA-2048` | Default lifetime / key algorithm |
+| `pki_state_dir` | `/etc/pki-manager/certs` | One state file per certificate (idempotency) |
+| `pki_cert_renew_before_days` | `30` | Issue a new certificate when the installed one expires sooner |
+| `pki_cert_force` | `false` | Issue again on every run (or `force: true` on one entry) |
+| `pki_revoke_replaced` | `true` | Revoke (`superseded`) the certificate a new one replaces |
+
+The default DNS SANs are `ansible_fqdn` and `ansible_hostname`, but only the names with two or more labels: the API rejects `web`. A host with no FQDN must set `cn` (and `dns_names`) for a `server` or `dual` certificate. The chain file is the CA certificate.
 
 Full docs: [`roles/pki_host_setup/README.md`](roles/pki_host_setup/README.md).
 
@@ -269,7 +280,7 @@ Provisions a full SSH-CA node from the PKI Manager external REST API in a single
 | `ssh_ca_base_url` | `https://pki.internal` | PKI Manager base URL |
 | `ssh_ca_fleet_token` | `""` | **Must be vaulted** — `pkimg_…` token scoped to one Host CA (ops `sign-host`, `get-principals`, and ECIES `register-host-pubkey`) |
 | `ssh_host_cert_ecies_enabled` | `false` | Master switch for the encrypted-KRL path (forces an `ecdsa-sha2-nistp256` host key) |
-| `ssh_host_cert_key_type` | `ecdsa` if ECIES else `ed25519` | Host key algorithm (ECIES is P-256-only) |
+| `ssh_host_cert_key_type` | `ecdsa` | Host key algorithm: the backend accepts only `ecdsa-sha2-nistp256` host keys |
 | `ssh_host_cert_renew_enabled` | `true` | Unattended renewal (stores the fleet token `0600` on the host) |
 | `ssh_host_cert_scheduler` | `cron` (alt `systemd`) | Substrate for renewal + krl-client |
 | `ssh_host_cert_reload_method` | `service` (alt `command` = SIGHUP) | How sshd reload runs |

@@ -1,7 +1,7 @@
 ---
 # Generate the host key ON the node — the private key is created on the target
-# and never leaves it. Algorithm is ed25519 by default, or ecdsa-sha2-nistp256
-# when ECIES is enabled (that same key is the local ECIES decrypt key, ANS-05).
+# and never leaves it. Algorithm is ecdsa-sha2-nistp256 (the only host key type
+# the backend accepts; the same key is the local ECIES decrypt key, ANS-05).
 - name: Generate the SSH host key on the node ({{ ssh_host_cert_key_type }})
   community.crypto.openssh_keypair:
     backend: opensshbin

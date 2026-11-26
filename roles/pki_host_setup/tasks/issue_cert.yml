@@ -1,20 +1,57 @@
 ---
-# Issue and install a single certificate
+# Issue (only when needed) and install one certificate.
+#
+# Idempotency: a state file on the host records the certificate id, a hash of
+# the request and notAfter. A new certificate is issued only when there is no
+# state, the request changed, a file is missing, the certificate expires within
+# pki_cert_renew_before_days, or force is set. Otherwise nothing changes.
 
 - name: Set certificate defaults
   ansible.builtin.set_fact:
     _cert_name: "{{ cert_config.name | default(ansible_hostname) }}"
     _cert_cn: "{{ cert_config.cn | default(ansible_fqdn | default(ansible_hostname)) }}"
     _cert_type: "{{ cert_config.type | default('server') }}"
-    _cert_dns_names: "{{ cert_config.dns_names | default([ansible_fqdn | default(ansible_hostname), ansible_hostname] | unique) }}"
-    _cert_ip_addresses: "{{ cert_config.ip_addresses | default([ansible_default_ipv4.address] | select('defined') | list) }}"
+    # The API rejects DNS names with one label ("web"), so the default keeps
+    # only the names with a dot.
+    _cert_dns_names: >-
+      {{ cert_config.dns_names
+         | default([ansible_fqdn | default(''), ansible_hostname | default('')]
+                   | select('search', '\.') | unique | list) }}
+    _cert_ip_addresses: "{{ cert_config.ip_addresses | default([ansible_default_ipv4.address] if ansible_default_ipv4.address is defined else []) }}"
     _cert_validity: "{{ cert_config.validity | default(pki_cert_validity) }}"
+    _cert_algorithm: "{{ cert_config.algorithm | default(pki_cert_algorithm) }}"
+    _cert_org: "{{ cert_config.org | default(pki_cert_org) }}"
+    _cert_country: "{{ cert_config.country | default(pki_cert_country) }}"
+    _cert_ou: "{{ cert_config.ou | default(pki_cert_ou) }}"
+    _cert_state_name: "{{ cert_config.state | default(pki_cert_state) }}"
+    _cert_locality: "{{ cert_config.locality | default(pki_cert_locality) }}"
     _cert_format: "{{ cert_config.format | default('pem') }}"
-    _cert_password: "{{ cert_config.password | default(omit) }}"
+    _cert_password: "{{ cert_config.password | default('') }}"
     _cert_owner: "{{ cert_config.owner | default('root') }}"
     _cert_group: "{{ cert_config.group | default('root') }}"
     _cert_key_group: "{{ cert_config.key_group | default('ssl-cert') }}"
     _cert_notify: "{{ cert_config.notify | default([]) }}"
+    _cert_force: "{{ cert_config.force | default(pki_cert_force) | bool }}"
+    # Reset the per-certificate results of the previous loop item.
+    _cert_id: ""
+    _cert_changed: false
+    _cert_revoke_old: {}
+
+- name: "Check the Common Name: {{ _cert_name }}"
+  ansible.builtin.assert:
+    that: (_cert_cn is search('\.')) or (_cert_type not in ['server', 'dual'])
+    fail_msg: >-
+      The CN "{{ _cert_cn }}" has one label. The API needs two or more labels for a
+      {{ _cert_type }} certificate (host.example.com, not host). This host has no FQDN:
+      set cn (and dns_names) for the {{ _cert_name }} entry in pki_certificates.
+    quiet: true
+
+- name: "Check the PKCS#12 password: {{ _cert_name }}"
+  ansible.builtin.assert:
+    that: _cert_password | length > 0
+    fail_msg: "Password is required for PKCS12/PFX format"
+    quiet: true
+  when: _cert_format in ['p12', 'pfx']
 
 - name: Set certificate filenames
   ansible.builtin.set_fact:
@@ -23,149 +60,228 @@
     _cert_chain_filename: "{{ cert_config.chain_filename | default(_cert_name + '-chain.crt') }}"
     _cert_fullchain_filename: "{{ cert_config.fullchain_filename | default(_cert_name + '-fullchain.crt') }}"
     _cert_p12_filename: "{{ cert_config.p12_filename | default(_cert_name + '.p12') }}"
+    _cert_state_file: "{{ pki_state_dir }}/{{ _cert_name }}.json"
+    # Everything that changes the certificate the server issues.
+    _cert_request_hash: >-
+      {{ {'ca_id': pki_ca_id, 'cn': _cert_cn, 'type': _cert_type,
+          'dns': _cert_dns_names | sort, 'ip': _cert_ip_addresses | sort,
+          'algorithm': _cert_algorithm, 'org': _cert_org, 'country': _cert_country,
+          'ou': _cert_ou, 'state': _cert_state_name, 'locality': _cert_locality,
+          'format': _cert_format} | to_json | hash('sha256') }}
 
-- name: "Issue certificate: {{ _cert_name }}"
-  oriolrius.pki_manager.pki_manager:
-    action: cert_issue
-    api_url: "{{ pki_api_url }}"
-    oidc_url: "{{ pki_oidc_url }}"
-    client_id: "{{ pki_client_id }}"
-    client_secret: "{{ pki_client_secret }}"
-    validate_certs: "{{ pki_validate_certs }}"
-    ca_id: "{{ pki_ca_id }}"
-    cert_cn: "{{ _cert_cn }}"
-    cert_type: "{{ _cert_type }}"
-    cert_dns_names: "{{ _cert_dns_names }}"
-    cert_ip_addresses: "{{ _cert_ip_addresses }}"
-    cert_validity: "{{ _cert_validity }}"
-    cert_algorithm: "{{ cert_config.algorithm | default(pki_cert_algorithm) }}"
-    cert_org: "{{ cert_config.org | default(pki_cert_org) }}"
-    cert_country: "{{ cert_config.country | default(pki_cert_country) }}"
-    cert_ou: "{{ cert_config.ou | default(pki_cert_ou) | default(omit, true) }}"
-    cert_state: "{{ cert_config.state | default(pki_cert_state) | default(omit, true) }}"
-    cert_locality: "{{ cert_config.locality | default(pki_cert_locality) | default(omit, true) }}"
-  register: _cert_issued
+- name: "Read the state of the installed certificate: {{ _cert_name }}"
+  ansible.builtin.slurp:
+    src: "{{ _cert_state_file }}"
+  register: _cert_state_raw
+  failed_when: false
 
-- name: "Download certificate (PEM): {{ _cert_name }}"
-  when: _cert_format == 'pem'
+- name: "Check the installed files: {{ _cert_name }}"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: >-
+    {{ [pki_cert_dir + '/' + _cert_filename, pki_key_dir + '/' + _cert_key_filename,
+        pki_cert_dir + '/' + _cert_chain_filename, pki_cert_dir + '/' + _cert_fullchain_filename]
+       if _cert_format == 'pem' else [pki_key_dir + '/' + _cert_p12_filename] }}
+  register: _cert_files
+
+- name: "Decide whether to issue a new certificate: {{ _cert_name }}"
+  ansible.builtin.set_fact:
+    _cert_state: "{{ (_cert_state_raw.content | b64decode | from_json) if (_cert_state_raw.content is defined) else {} }}"
+    _cert_files_ok: "{{ _cert_files.results | map(attribute='stat.exists') | min }}"
+
+- name: "Compute the reason for a new certificate: {{ _cert_name }}"
+  ansible.builtin.set_fact:
+    _cert_days_left: >-
+      {{ (((_cert_state.not_after | to_datetime('%Y-%m-%dT%H:%M:%S.%fZ')) - now(utc=true)).days)
+         if (_cert_state.not_after | default('')) | length > 0 else -1 }}
+    _cert_issue_reason: >-
+      {{ 'force' if _cert_force
+         else 'no state' if (_cert_state.cert_id | default('')) | length == 0
+         else 'request changed' if _cert_state.request_hash | default('') != _cert_request_hash
+         else 'file missing' if not (_cert_files_ok | bool)
+         else '' }}
+
+- name: "Add the expiry reason: {{ _cert_name }}"
+  ansible.builtin.set_fact:
+    _cert_issue_reason: >-
+      {{ _cert_issue_reason if _cert_issue_reason | length > 0
+         else ('expires in ' ~ _cert_days_left ~ ' days')
+         if (_cert_days_left | int) < (pki_cert_renew_before_days | int) else '' }}
+
+- name: "Keep the installed certificate: {{ _cert_name }}"
+  ansible.builtin.set_fact:
+    _cert_id: "{{ _cert_state.cert_id }}"
+    _cert_changed: false
+  when: _cert_issue_reason | length == 0
+
+- name: "Check mode: a new certificate would be issued: {{ _cert_name }}"
+  ansible.builtin.debug:
+    msg: "A new certificate would be issued for {{ _cert_name }} ({{ _cert_issue_reason }})"
+  changed_when: true
+  when:
+    - _cert_issue_reason | length > 0
+    - ansible_check_mode
+
+- name: "Issue and install a new certificate when needed: {{ _cert_name }}"
+  when:
+    - _cert_issue_reason | length > 0
+    - not ansible_check_mode
+  module_defaults:
+    oriolrius.pki_manager.pki_manager:
+      api_url: "{{ pki_api_url }}"
+      oidc_url: "{{ pki_oidc_url | default(omit, true) }}"
+      client_id: "{{ pki_client_id | default(omit, true) }}"
+      client_secret: "{{ pki_client_secret | default(omit, true) }}"
+      api_token: "{{ pki_api_token | default(omit, true) }}"
+      ca_path: "{{ pki_ca_path | default(omit, true) }}"
+      validate_certs: "{{ pki_validate_certs }}"
   block:
-    - name: Download certificate file
+    - name: "Issue certificate: {{ _cert_name }}"
       oriolrius.pki_manager.pki_manager:
-        action: cert_download
-        api_url: "{{ pki_api_url }}"
-        oidc_url: "{{ pki_oidc_url }}"
-        client_id: "{{ pki_client_id }}"
-        client_secret: "{{ pki_client_secret }}"
-        validate_certs: "{{ pki_validate_certs }}"
-        cert_id: "{{ _cert_issued.cert_id }}"
-        download_format: "pem"
-        download_dest: "{{ pki_cert_dir }}/{{ _cert_filename }}"
-      register: _cert_downloaded
+        action: cert_issue
+        ca_id: "{{ pki_ca_id }}"
+        cert_cn: "{{ _cert_cn }}"
+        cert_type: "{{ _cert_type }}"
+        cert_dns_names: "{{ _cert_dns_names }}"
+        cert_ip_addresses: "{{ _cert_ip_addresses }}"
+        cert_validity: "{{ _cert_validity }}"
+        cert_algorithm: "{{ _cert_algorithm }}"
+        cert_org: "{{ _cert_org }}"
+        cert_country: "{{ _cert_country }}"
+        cert_ou: "{{ _cert_ou | default(omit, true) }}"
+        cert_state: "{{ _cert_state_name | default(omit, true) }}"
+        cert_locality: "{{ _cert_locality | default(omit, true) }}"
+      register: _cert_issued
+      delegate_to: localhost
+      become: false
 
-    - name: Set certificate file permissions
-      ansible.builtin.file:
-        path: "{{ pki_cert_dir }}/{{ _cert_filename }}"
-        owner: "{{ _cert_owner }}"
-        group: "{{ _cert_group }}"
+    - name: Create a private download directory on the controller
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: .pki
+      register: _cert_tmp
+      delegate_to: localhost
+      become: false
+
+    - name: Download and install the PEM files
+      when: _cert_format == 'pem'
+      block:
+        - name: "Download the PEM files: {{ _cert_name }}"
+          oriolrius.pki_manager.pki_manager:
+            action: cert_download
+            cert_id: "{{ _cert_issued.cert_id }}"
+            download_format: "{{ item }}"
+            download_dest: "{{ _cert_tmp.path }}/{{ item }}"
+          # No chain-pem: the REST API returns only the leaf for it. The chain
+          # file is written from the CA certificate below (root CAs only).
+          loop: [pem, key-pem, full-pem]
+          delegate_to: localhost
+          become: false
+
+        - name: "Install the PEM files: {{ _cert_name }}"
+          ansible.builtin.copy:
+            src: "{{ _cert_tmp.path }}/{{ item.src }}"
+            dest: "{{ item.dest }}"
+            owner: "{{ _cert_owner }}"
+            group: "{{ item.group }}"
+            mode: "{{ item.mode }}"
+          loop:
+            - { src: pem, dest: "{{ pki_cert_dir }}/{{ _cert_filename }}", group: "{{ _cert_group }}", mode: "0644" }
+            - { src: key-pem, dest: "{{ pki_key_dir }}/{{ _cert_key_filename }}", group: "{{ _cert_key_group }}", mode: "0640" }
+            - { src: full-pem, dest: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}", group: "{{ _cert_group }}", mode: "0644" }
+          loop_control:
+            label: "{{ item.dest }}"
+
+        - name: "Install the CA chain file: {{ _cert_name }}"
+          ansible.builtin.copy:
+            content: "{{ _pki_ca_info.ca.certificatePem | trim }}\n"
+            dest: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
+            owner: "{{ _cert_owner }}"
+            group: "{{ _cert_group }}"
+            mode: "0644"
+
+    - name: Download and install the PKCS#12 file
+      when: _cert_format in ['p12', 'pfx']
+      block:
+        - name: "Download the PKCS#12 file: {{ _cert_name }}"
+          oriolrius.pki_manager.pki_manager:
+            action: cert_download
+            cert_id: "{{ _cert_issued.cert_id }}"
+            download_format: p12
+            download_password: "{{ _cert_password }}"
+            download_dest: "{{ _cert_tmp.path }}/p12"
+          delegate_to: localhost
+          become: false
+
+        - name: "Install the PKCS#12 file: {{ _cert_name }}"
+          ansible.builtin.copy:
+            src: "{{ _cert_tmp.path }}/p12"
+            dest: "{{ pki_key_dir }}/{{ _cert_p12_filename }}"
+            owner: "{{ _cert_owner }}"
+            group: "{{ _cert_key_group }}"
+            mode: "0640"
+
+    - name: "Record the state of the new certificate: {{ _cert_name }}"
+      ansible.builtin.copy:
+        content: >-
+          {{ {'cert_id': _cert_issued.cert_id, 'request_hash': _cert_request_hash,
+              'not_after': _cert_issued.certificate.notAfter,
+              'serial_number': _cert_issued.certificate.serialNumber} | to_nice_json }}
+        dest: "{{ _cert_state_file }}"
+        owner: root
+        group: root
         mode: "0644"
 
-    - name: Download private key
+    - name: "Revoke the replaced certificate: {{ _cert_name }}"
       oriolrius.pki_manager.pki_manager:
-        action: cert_download
-        api_url: "{{ pki_api_url }}"
-        oidc_url: "{{ pki_oidc_url }}"
-        client_id: "{{ pki_client_id }}"
-        client_secret: "{{ pki_client_secret }}"
-        validate_certs: "{{ pki_validate_certs }}"
-        cert_id: "{{ _cert_issued.cert_id }}"
-        download_format: "key-pem"
-        download_dest: "{{ pki_key_dir }}/{{ _cert_key_filename }}"
-      register: _key_downloaded
+        action: cert_revoke
+        cert_id: "{{ _cert_state.cert_id }}"
+        revocation_reason: superseded
+      register: _cert_revoke_old
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      when:
+        - pki_revoke_replaced | bool
+        - (_cert_state.cert_id | default('')) | length > 0
+        - _cert_state.cert_id != _cert_issued.cert_id
 
-    - name: Set private key permissions
+    - name: "Warn when the replaced certificate was not revoked: {{ _cert_name }}"
+      ansible.builtin.debug:
+        msg: "The replaced certificate {{ _cert_state.cert_id }} was not revoked: {{ _cert_revoke_old.msg | default('') }}"
+      when:
+        - _cert_revoke_old is not skipped
+        - _cert_revoke_old.failed | default(false)
+
+    - name: Mark the certificate as new
+      ansible.builtin.set_fact:
+        _cert_id: "{{ _cert_issued.cert_id }}"
+        _cert_changed: true
+
+  always:
+    - name: Remove the download directory on the controller
       ansible.builtin.file:
-        path: "{{ pki_key_dir }}/{{ _cert_key_filename }}"
-        owner: "{{ _cert_owner }}"
-        group: "{{ _cert_key_group }}"
-        mode: "0640"
-
-    - name: Download certificate chain
-      oriolrius.pki_manager.pki_manager:
-        action: cert_download
-        api_url: "{{ pki_api_url }}"
-        oidc_url: "{{ pki_oidc_url }}"
-        client_id: "{{ pki_client_id }}"
-        client_secret: "{{ pki_client_secret }}"
-        validate_certs: "{{ pki_validate_certs }}"
-        cert_id: "{{ _cert_issued.cert_id }}"
-        download_format: "chain-pem"
-        download_dest: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
-
-    - name: Set chain file permissions
-      ansible.builtin.file:
-        path: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
-        owner: "{{ _cert_owner }}"
-        group: "{{ _cert_group }}"
-        mode: "0644"
-
-    - name: Download full chain (cert + chain)
-      oriolrius.pki_manager.pki_manager:
-        action: cert_download
-        api_url: "{{ pki_api_url }}"
-        oidc_url: "{{ pki_oidc_url }}"
-        client_id: "{{ pki_client_id }}"
-        client_secret: "{{ pki_client_secret }}"
-        validate_certs: "{{ pki_validate_certs }}"
-        cert_id: "{{ _cert_issued.cert_id }}"
-        download_format: "full-pem"
-        download_dest: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}"
-
-    - name: Set fullchain file permissions
-      ansible.builtin.file:
-        path: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}"
-        owner: "{{ _cert_owner }}"
-        group: "{{ _cert_group }}"
-        mode: "0644"
-
-- name: "Download certificate (PKCS12): {{ _cert_name }}"
-  when: _cert_format in ['p12', 'pfx']
-  block:
-    - name: Validate password is provided for PKCS12
-      ansible.builtin.assert:
-        that:
-          - _cert_password is defined
-          - _cert_password | length > 0
-        fail_msg: "Password is required for PKCS12/PFX format"
-
-    - name: Download PKCS12 file
-      oriolrius.pki_manager.pki_manager:
-        action: cert_download
-        api_url: "{{ pki_api_url }}"
-        oidc_url: "{{ pki_oidc_url }}"
-        client_id: "{{ pki_client_id }}"
-        client_secret: "{{ pki_client_secret }}"
-        validate_certs: "{{ pki_validate_certs }}"
-        cert_id: "{{ _cert_issued.cert_id }}"
-        download_format: "p12"
-        download_password: "{{ _cert_password }}"
-        download_dest: "{{ pki_key_dir }}/{{ _cert_p12_filename }}"
-      register: _p12_downloaded
-
-    - name: Set PKCS12 file permissions
-      ansible.builtin.file:
-        path: "{{ pki_key_dir }}/{{ _cert_p12_filename }}"
-        owner: "{{ _cert_owner }}"
-        group: "{{ _cert_key_group }}"
-        mode: "0640"
+        path: "{{ _cert_tmp.path }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      when: _cert_tmp.path is defined
 
 - name: Store certificate info for later use
   ansible.builtin.set_fact:
-    pki_issued_certificates: "{{ pki_issued_certificates | default({}) | combine({_cert_name: {'cert_id': _cert_issued.cert_id, 'cn': _cert_cn, 'cert_path': pki_cert_dir + '/' + _cert_filename, 'key_path': pki_key_dir + '/' + _cert_key_filename, 'chain_path': pki_cert_dir + '/' + _cert_chain_filename, 'fullchain_path': pki_cert_dir + '/' + _cert_fullchain_filename}}) }}"
+    pki_issued_certificates: >-
+      {{ pki_issued_certificates | default({}) | combine({_cert_name: {
+           'cert_id': _cert_id | default(''), 'cn': _cert_cn, 'changed': _cert_changed | default(false),
+           'cert_path': pki_cert_dir + '/' + _cert_filename,
+           'key_path': pki_key_dir + '/' + _cert_key_filename,
+           'chain_path': pki_cert_dir + '/' + _cert_chain_filename,
+           'fullchain_path': pki_cert_dir + '/' + _cert_fullchain_filename}}) }}
 
 - name: Notify handlers for certificate changes
   when:
     - _cert_notify | length > 0
-    - _cert_issued.changed or (_cert_downloaded.changed | default(false)) or (_key_downloaded.changed | default(false)) or (_p12_downloaded.changed | default(false))
+    - _cert_changed | default(false) | bool
   ansible.builtin.debug:
     msg: "Certificate {{ _cert_name }} changed, notifying: {{ _cert_notify }}"
   changed_when: true
