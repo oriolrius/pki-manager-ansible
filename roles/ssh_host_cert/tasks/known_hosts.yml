@@ -6,6 +6,7 @@
 - name: Fetch the @cert-authority known_hosts line for the Host CA
   oriolrius.pki_manager.pki_manager:
     action: ssh_cert_authority
+    zone: "{{ ssh_host_cert_zone | default(omit, true) }}"
     api_url: "{{ ssh_host_cert_api_v1 }}"
     validate_certs: "{{ ssh_host_cert_validate_certs }}"
     cert_authority_pattern: "{{ ssh_host_cert_known_hosts_pattern }}"

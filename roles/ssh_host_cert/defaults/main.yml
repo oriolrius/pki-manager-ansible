@@ -21,6 +21,12 @@ ssh_host_cert_api_v1: "{{ ssh_ca_base_url }}/api/v1"
 # host the token needs ops: sign-host, get-principals, and (ECIES) register-host-pubkey.
 # Store in Ansible Vault; NEVER in plain inventory.
 ssh_ca_fleet_token: ""
+# SSH zone (id or name) of this host: the zone of the fleet token. With one
+# zone, leave it empty. With two or more zones it is REQUIRED: the trust
+# anchors (TrustedUserCAKeys, Host CA, @cert-authority) are per zone, and the
+# empty value installs the DEFAULT zone's CAs — the wrong tenant's users could
+# log in, and this zone's users could not.
+ssh_host_cert_zone: ""
 ssh_host_cert_validate_certs: true
 
 # --- Host key algorithm ------------------------------------------------------

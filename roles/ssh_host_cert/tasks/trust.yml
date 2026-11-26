@@ -3,6 +3,7 @@
 - name: Fetch the User CA trust bundle (TrustedUserCAKeys)
   oriolrius.pki_manager.pki_manager:
     action: ssh_trusted_user_ca
+    zone: "{{ ssh_host_cert_zone | default(omit, true) }}"
     api_url: "{{ ssh_host_cert_api_v1 }}"
     validate_certs: "{{ ssh_host_cert_validate_certs }}"
   register: ssh_host_cert_user_ca
@@ -29,6 +30,7 @@
 - name: Fetch the Host CA trust anchor (KRL signature verification)
   oriolrius.pki_manager.pki_manager:
     action: ssh_host_ca
+    zone: "{{ ssh_host_cert_zone | default(omit, true) }}"
     api_url: "{{ ssh_host_cert_api_v1 }}"
     validate_certs: "{{ ssh_host_cert_validate_certs }}"
   register: ssh_host_cert_host_ca
