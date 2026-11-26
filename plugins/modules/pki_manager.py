@@ -217,6 +217,31 @@ options:
     revocation_details:
         description: Free-text detail recorded with the revocation (cert_revoke, ca_revoke).
         type: str
+    revocation_effective_date:
+        description: Unix timestamp of the effective revocation date (cert_revoke).
+        type: int
+    generate_crl:
+        description: Generate a new CRL of the CA after the revocation (cert_revoke).
+        type: bool
+    renew_new_key:
+        description:
+            - cert_renew. V(true) makes a new key pair (the server default), V(false) keeps the current key.
+        type: bool
+    revoke_original:
+        description: Revoke the original certificate after the renewal (cert_renew).
+        type: bool
+    destroy_key:
+        description:
+            - Also destroy the private key in the KMS (ca_delete, cert_delete).
+            - The server keeps a key that another certificate still uses (renewal with the same key).
+        type: bool
+    remove_from_crl:
+        description: Request removal from the CRL (cert_delete).
+        type: bool
+    tags:
+        description: Tags of the new CA or certificate (ca_create, cert_issue).
+        type: list
+        elements: str
     cert_pem:
         description:
             - PEM of a certificate for cert_find. The module reads its serial number (Python C(cryptography))
@@ -279,6 +304,16 @@ options:
             - API request timeout in seconds.
         type: int
         default: 30
+    rate_limit_retries:
+        description:
+            - On HTTP 429 (rate limit), wait for C(Retry-After) and retry this many times.
+            - The default 0 fails at once, as before.
+        type: int
+        default: 0
+    rate_limit_max_wait:
+        description: The longest total time in seconds to wait for HTTP 429 retries; a longer C(Retry-After) fails at once.
+        type: int
+        default: 120
     token_cache_path:
         description:
             - File for the OIDC token cache.
@@ -360,6 +395,27 @@ options:
         description: Principals to encode in the user certificate (ssh_user_issue).
         type: list
         elements: str
+    user_extensions:
+        description: OpenSSH certificate extensions of the user certificate (ssh_user_issue).
+        type: list
+        elements: str
+        choices: [permit-X11-forwarding, permit-agent-forwarding, permit-port-forwarding, permit-pty, permit-user-rc]
+    force_command:
+        description: C(force-command) critical option of the user certificate (ssh_user_issue).
+        type: str
+    source_address:
+        description: C(source-address) critical option, comma-separated CIDRs (ssh_user_issue).
+        type: str
+    user_key_id:
+        description: Key id of the user certificate (ssh_user_issue).
+        type: str
+    allowed_principals:
+        description: Principals the fleet token may put in certificates (ssh_token_mint).
+        type: list
+        elements: str
+    max_valid_seconds:
+        description: Maximum validity in seconds of the certificates the fleet token signs (ssh_token_mint).
+        type: int
     user_valid_seconds:
         description:
             - Validity in seconds for the user cert (ssh_user_issue).
@@ -547,6 +603,7 @@ import hashlib
 import tempfile
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.urls import open_url
+from email.utils import parsedate_to_datetime
 
 try:
     from urllib.parse import urlencode, quote
@@ -567,7 +624,8 @@ class PKIManagerClient:
 
     def __init__(self, module, api_url, oidc_url, client_id, client_secret,
                  validate_certs=True, timeout=30, token_cache_path=None,
-                 fleet_token=None, api_token=None, ca_path=None):
+                 fleet_token=None, api_token=None, ca_path=None,
+                 rate_limit_retries=0, rate_limit_max_wait=120):
         self.module = module
         self.api_url = api_url.rstrip('/')
         self.oidc_url = oidc_url
@@ -583,13 +641,51 @@ class PKIManagerClient:
         self.api_token = api_token
         self.access_token = None
         self.token_from_cache = False
+        self.rate_limit_retries = max(0, rate_limit_retries or 0)
+        self.rate_limit_max_wait = max(0, rate_limit_max_wait or 0)
+        self.rate_limit_waits = []
+
+    @staticmethod
+    def retry_after_seconds(value, now=None):
+        """Retry-After as seconds: a number, or an HTTP date. None when unusable."""
+        if value is None:
+            return None
+        value = str(value).strip()
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            pass
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        now = now if now is not None else time.time()
+        return max(0.0, when.timestamp() - now)
 
     def _open(self, url, **kwargs):
         kwargs.setdefault('timeout', self.timeout)
         kwargs.setdefault('validate_certs', self.validate_certs)
         if self.ca_path:
             kwargs.setdefault('ca_path', self.ca_path)
-        return open_url(url, **kwargs)
+        attempt, waited = 0, 0.0
+        while True:
+            try:
+                return open_url(url, **kwargs)
+            except Exception as e:
+                if getattr(e, 'code', None) != 429 or attempt >= self.rate_limit_retries:
+                    raise
+                headers = getattr(e, 'headers', None) or getattr(e, 'hdrs', None) or {}
+                delay = self.retry_after_seconds(headers.get('Retry-After') if headers else None)
+                if delay is None:
+                    delay = float(2 ** attempt)  # no usable Retry-After: 1, 2, 4 ... s
+                if waited + delay > self.rate_limit_max_wait:
+                    raise
+                time.sleep(delay)
+                waited += delay
+                attempt += 1
+                self.rate_limit_waits.append(round(delay, 3))
 
     def has_credentials(self):
         return bool(self.api_token or (self.oidc_url and self.client_id and self.client_secret))
@@ -761,6 +857,9 @@ class PKIManagerClient:
             error_msg = 'Not found'
         if status == 409 and error_msg == error_str:
             error_msg = 'Conflict - operation blocked'
+        if status == 429:
+            error_msg = (f"{error_msg} (HTTP 429: rate limited; set rate_limit_retries to wait for"
+                         " Retry-After and retry)")
         return {'status': status, 'data': None, 'error': error_msg, 'body': body}
 
     def get(self, endpoint, params=None, extra_headers=None):
@@ -786,8 +885,8 @@ class PKIManagerClient:
     def post(self, endpoint, data=None):
         return self._request('POST', endpoint, data=data)
 
-    def delete(self, endpoint):
-        return self._request('DELETE', endpoint)
+    def delete(self, endpoint, params=None):
+        return self._request('DELETE', endpoint, params=params)
 
     # Action implementations
     def auth_test(self):
@@ -832,7 +931,7 @@ class PKIManagerClient:
         }
 
     def ca_create(self, cn, org, country, ou=None, state=None, locality=None,
-                  algorithm='RSA-4096', validity_years=None):
+                  algorithm='RSA-4096', validity_years=None, tags=None):
         """Create a Certificate Authority."""
         payload = {
             'subject': {
@@ -844,6 +943,8 @@ class PKIManagerClient:
         }
         if validity_years:
             payload['validityYears'] = validity_years
+        if tags:
+            payload['tags'] = tags
         if ou:
             payload['subject']['organizationalUnit'] = ou
         if state:
@@ -892,9 +993,10 @@ class PKIManagerClient:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {'changed': True, 'msg': f"CA {ca_id} revoked with reason: {reason}"}
 
-    def ca_delete(self, ca_id):
+    def ca_delete(self, ca_id, destroy_key=None):
         """Delete a CA."""
-        result = self.delete(f'/cas/{ca_id}')
+        params = {} if destroy_key is None else {'destroyKey': str(bool(destroy_key)).lower()}
+        result = self.delete(f'/cas/{ca_id}', params=params or None)
         if result['status'] == 404:
             return {'changed': False, 'msg': f"CA {ca_id} not found (already deleted?)"}
         if result['status'] == 409:
@@ -905,7 +1007,7 @@ class PKIManagerClient:
 
     def cert_issue(self, ca_id, cn, org=None, country=None, ou=None, state=None,
                    locality=None, cert_type=None, algorithm='RSA-2048',
-                   validity=365, dns_names=None, ip_addresses=None, emails=None):
+                   validity=365, dns_names=None, ip_addresses=None, emails=None, tags=None):
         """Issue a certificate."""
         payload = {
             'caId': ca_id,
@@ -930,6 +1032,8 @@ class PKIManagerClient:
             payload['sanIp'] = ip_addresses
         if emails:
             payload['sanEmail'] = emails
+        if tags:
+            payload['tags'] = tags
 
         result = self.post('/certificates/', payload)
         if result['error']:
@@ -970,9 +1074,26 @@ class PKIManagerClient:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {'changed': False, 'certificate': result['data'], 'msg': f"Retrieved certificate {cert_id}"}
 
-    def cert_renew(self, cert_id, validity=365):
-        """Renew a certificate."""
-        result = self.post(f'/certificates/{cert_id}/renew', {'validityDays': validity})
+    def cert_renew(self, cert_id, validity=365, new_key=None, revoke_original=None,
+                   subject=None, dns_names=None, ip_addresses=None, emails=None):
+        """Renew a certificate; any subject or SAN value sets updateInfo."""
+        payload = {'validityDays': validity}
+        if new_key is not None:
+            payload['generateNewKey'] = bool(new_key)
+        if revoke_original is not None:
+            payload['revokeOriginal'] = bool(revoke_original)
+        subject = {k: v for k, v in (subject or {}).items() if v}
+        if subject or dns_names or ip_addresses or emails:
+            payload['updateInfo'] = True
+        if subject:
+            payload['subject'] = subject
+        if dns_names:
+            payload['sanDns'] = dns_names
+        if ip_addresses:
+            payload['sanIp'] = ip_addresses
+        if emails:
+            payload['sanEmail'] = emails
+        result = self.post(f'/certificates/{cert_id}/renew', payload)
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {
@@ -982,19 +1103,28 @@ class PKIManagerClient:
             'msg': f"Certificate renewed, new ID: {result['data']['id']}",
         }
 
-    def cert_revoke(self, cert_id, reason='unspecified', details=None):
+    def cert_revoke(self, cert_id, reason='unspecified', details=None, effective_date=None, generate_crl=None):
         """Revoke a certificate."""
         payload = {'reason': reason}
         if details:
             payload['details'] = details
+        if effective_date is not None:
+            payload['effectiveDate'] = effective_date
+        if generate_crl is not None:
+            payload['generateCrl'] = bool(generate_crl)
         result = self.post(f'/certificates/{cert_id}/revoke', payload)
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {'changed': True, 'msg': f"Certificate {cert_id} revoked with reason: {reason}"}
 
-    def cert_delete(self, cert_id):
+    def cert_delete(self, cert_id, destroy_key=None, remove_from_crl=None):
         """Delete a certificate."""
-        result = self.delete(f'/certificates/{cert_id}')
+        params = {}
+        if destroy_key is not None:
+            params['destroyKey'] = str(bool(destroy_key)).lower()
+        if remove_from_crl is not None:
+            params['removeFromCrl'] = str(bool(remove_from_crl)).lower()
+        result = self.delete(f'/certificates/{cert_id}', params=params or None)
         if result['status'] == 404:
             return {'changed': False, 'msg': f"Certificate {cert_id} not found (already deleted?)"}
         if result['status'] == 409:
@@ -1192,8 +1322,13 @@ class PKIManagerClient:
             return {'changed': False, 'failed': True, 'msg': r['error']}
         return {'changed': False, 'ssh_cas': r['data'], 'msg': f"Found {len(r['data'])} SSH CAs"}
 
-    def ssh_token_mint(self, name, host_ca_id=None, user_ca_id=None, ops=None, zone=None):
+    def ssh_token_mint(self, name, host_ca_id=None, user_ca_id=None, ops=None, zone=None,
+                       allowed_principals=None, max_valid_seconds=None):
         payload = {'name': name, 'opSet': ops or []}
+        if allowed_principals:
+            payload['allowedPrincipals'] = allowed_principals
+        if max_valid_seconds:
+            payload['maxValidForSeconds'] = max_valid_seconds
         if zone:
             payload['zone'] = zone
         if host_ca_id:
@@ -1245,8 +1380,17 @@ class PKIManagerClient:
         return {'changed': True, 'msg': f"Mapped principal {principal_id} -> {local_account} on host {host_id}"}
 
     def ssh_user_issue(self, identity_id, ssh_public_key, principals, ca_id=None,
-                       valid_for_seconds=None, enforce_entitlement=None):
+                       valid_for_seconds=None, enforce_entitlement=None, extensions=None,
+                       force_command=None, source_address=None, key_id=None):
         payload = {'identityId': identity_id, 'sshPublicKey': ssh_public_key, 'principals': principals}
+        if extensions is not None:
+            payload['extensions'] = extensions
+        if force_command:
+            payload['forceCommand'] = force_command
+        if source_address:
+            payload['sourceAddress'] = source_address
+        if key_id:
+            payload['keyId'] = key_id
         if ca_id:
             payload['caId'] = ca_id
         if valid_for_seconds:
@@ -1447,6 +1591,13 @@ def run_module():
             'superseded', 'cessationOfOperation', 'certificateHold', 'removeFromCRL',
         ]),
         revocation_details=dict(type='str'),
+        revocation_effective_date=dict(type='int'),
+        generate_crl=dict(type='bool'),
+        renew_new_key=dict(type='bool'),
+        revoke_original=dict(type='bool'),
+        destroy_key=dict(type='bool', no_log=False),
+        remove_from_crl=dict(type='bool'),
+        tags=dict(type='list', elements='str'),
         cert_pem=dict(type='str'),
         # Download
         download_format=dict(type='str', default='pem', choices=[
@@ -1481,6 +1632,14 @@ def run_module():
         local_account=dict(type='str'),
         ssh_public_key=dict(type='str'),
         principals=dict(type='list', elements='str'),
+        user_extensions=dict(type='list', elements='str', choices=[
+            'permit-X11-forwarding', 'permit-agent-forwarding', 'permit-port-forwarding',
+            'permit-pty', 'permit-user-rc']),
+        force_command=dict(type='str'),
+        source_address=dict(type='str'),
+        user_key_id=dict(type='str', no_log=False),
+        allowed_principals=dict(type='list', elements='str'),
+        max_valid_seconds=dict(type='int'),
         user_valid_seconds=dict(type='int'),
         host_valid_seconds=dict(type='int'),
         host_key_id=dict(type='str'),
@@ -1496,6 +1655,8 @@ def run_module():
         # Connection
         validate_certs=dict(type='bool', default=True),
         timeout=dict(type='int', default=30),
+        rate_limit_retries=dict(type='int', default=0),
+        rate_limit_max_wait=dict(type='int', default=120),
         token_cache_path=dict(type='path', no_log=False),
     )
 
@@ -1552,6 +1713,8 @@ def run_module():
         fleet_token=module.params.get('fleet_token'),
         api_token=module.params.get('api_token'),
         ca_path=module.params.get('ca_path'),
+        rate_limit_retries=module.params['rate_limit_retries'],
+        rate_limit_max_wait=module.params['rate_limit_max_wait'],
     )
 
     # Authenticate (OIDC; no-op when no client credentials are supplied)
@@ -1598,6 +1761,7 @@ def run_module():
                 locality=module.params['ca_locality'],
                 algorithm=module.params['ca_algorithm'],
                 validity_years=validity_years,
+                tags=module.params.get('tags'),
             )
 
     elif action == 'ca_list':
@@ -1620,7 +1784,7 @@ def run_module():
         if module.check_mode:
             result = {'changed': True, 'msg': 'CA would be deleted (check mode)'}
         else:
-            result = client.ca_delete(ca_id=module.params['ca_id'])
+            result = client.ca_delete(ca_id=module.params['ca_id'], destroy_key=module.params.get('destroy_key'))
 
     elif action == 'cert_issue':
         if module.check_mode:
@@ -1640,6 +1804,7 @@ def run_module():
                 dns_names=module.params['cert_dns_names'],
                 ip_addresses=module.params['cert_ip_addresses'],
                 emails=module.params['cert_emails'],
+                tags=module.params.get('tags'),
             )
 
     elif action == 'cert_list':
@@ -1662,6 +1827,19 @@ def run_module():
             result = client.cert_renew(
                 cert_id=module.params['cert_id'],
                 validity=module.params['cert_validity'],
+                new_key=module.params.get('renew_new_key'),
+                revoke_original=module.params.get('revoke_original'),
+                subject={
+                    'commonName': module.params.get('cert_cn'),
+                    'organization': module.params.get('cert_org'),
+                    'country': module.params.get('cert_country'),
+                    'organizationalUnit': module.params.get('cert_ou'),
+                    'state': module.params.get('cert_state'),
+                    'locality': module.params.get('cert_locality'),
+                },
+                dns_names=module.params.get('cert_dns_names'),
+                ip_addresses=module.params.get('cert_ip_addresses'),
+                emails=module.params.get('cert_emails'),
             )
 
     elif action == 'cert_revoke':
@@ -1672,13 +1850,17 @@ def run_module():
                 cert_id=module.params['cert_id'],
                 reason=module.params['revocation_reason'],
                 details=module.params.get('revocation_details'),
+                effective_date=module.params.get('revocation_effective_date'),
+                generate_crl=module.params.get('generate_crl'),
             )
 
     elif action == 'cert_delete':
         if module.check_mode:
             result = {'changed': True, 'msg': 'Certificate would be deleted (check mode)'}
         else:
-            result = client.cert_delete(cert_id=module.params['cert_id'])
+            result = client.cert_delete(cert_id=module.params['cert_id'],
+                                        destroy_key=module.params.get('destroy_key'),
+                                        remove_from_crl=module.params.get('remove_from_crl'))
 
     elif action == 'cert_download':
         # Validate password for encrypted formats
@@ -1718,6 +1900,8 @@ def run_module():
                 user_ca_id=module.params.get('user_ca_id'),
                 ops=module.params.get('token_ops'),
                 zone=module.params.get('zone'),
+                allowed_principals=module.params.get('allowed_principals'),
+                max_valid_seconds=module.params.get('max_valid_seconds'),
             )
 
     elif action == 'ssh_identity_create':
@@ -1760,6 +1944,10 @@ def run_module():
                 ca_id=module.params.get('user_ca_id'),
                 valid_for_seconds=module.params.get('user_valid_seconds'),
                 enforce_entitlement=module.params.get('enforce_entitlement'),
+                extensions=module.params.get('user_extensions'),
+                force_command=module.params.get('force_command'),
+                source_address=module.params.get('source_address'),
+                key_id=module.params.get('user_key_id'),
             )
 
     elif action == 'ssh_host_register':
@@ -1837,6 +2025,9 @@ def run_module():
         else:
             result = client.ssh_zone_create(module.params['zone'], module.params.get('zone_display_name'),
                                             module.params.get('zone_description'))
+
+    if client.rate_limit_waits:
+        result['rate_limit_waits'] = client.rate_limit_waits
 
     # Return result
     if result.get('failed'):
