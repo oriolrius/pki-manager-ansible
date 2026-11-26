@@ -74,7 +74,9 @@
         mode: "0644"
       register: _pki_ca_installed
 
-    - name: Update CA certificates
+    # Not a handler: the trust store must be current before the certificates are
+    # used later in the same play.
+    - name: Update CA certificates  # noqa: no-handler
       ansible.builtin.command: update-ca-certificates
       when: _pki_ca_installed.changed
       changed_when: true

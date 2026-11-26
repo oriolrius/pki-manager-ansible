@@ -1,3 +1,4 @@
+---
 # ansible-lint config for the oriolrius.pki_manager collection.
 #
 # yaml[line-length] is a warning, not a failure: the only long lines are cron
@@ -11,3 +12,9 @@
 warn_list:
   - yaml[line-length]
   - args[module]
+
+# var-naming[no-role-prefix]: the role variables (pki_*, ssh_ca_*, ssh_host_cert_*)
+# are the documented interface of the roles since 2.x; renaming them to the
+# role-name prefix would break every playbook that uses the collection.
+skip_list:
+  - var-naming[no-role-prefix]

@@ -1,0 +1,1 @@
+roles/ssh_host_cert/templates/pki-manager-ssh-renew.j2 shebang  # a template for a host script, not a module

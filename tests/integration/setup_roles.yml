@@ -1,0 +1,59 @@
+---
+# Server-side fixtures for roles.yml: an X.509 CA, an SSH zone with a user CA
+# and a host CA, and a fleet token. Written to fixtures.yml in the work dir, so
+# roles.yml can run twice with the same values (the idempotency check).
+- name: Create the fixtures for the role tests
+  hosts: localhost
+  gather_facts: false
+  vars:
+    api_url: "{{ lookup('env', 'PKI_API_URL') | default('http://127.0.0.1:3000/api/v1', true) }}"
+    work_dir: "{{ lookup('env', 'PKI_IT_WORK') | default('/tmp/pki-ansible-it', true) }}"
+    zone: "roles-{{ run_id }}"
+  module_defaults:
+    oriolrius.pki_manager.pki_manager:
+      api_url: "{{ api_url }}"
+  tasks:
+    # Once: a var with lookup('pipe', ...) is evaluated again at each use.
+    - name: Run id
+      ansible.builtin.set_fact:
+        run_id: "{{ lookup('pipe', 'date +%s') }}"
+    - name: X.509 CA for pki_host_setup
+      oriolrius.pki_manager.pki_manager:
+        action: ca_create
+        ca_cn: "Roles CA {{ run_id }}"
+        ca_org: Integration
+        ca_country: ES
+        ca_validity_years: 2
+      register: ca
+
+    - name: SSH zone
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_zone_create
+        zone: "{{ zone }}"
+
+    - name: SSH user and host CAs
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_ca_create
+        ssh_ca_type: "{{ item }}"
+        ssh_ca_label: "roles-{{ item }}"
+        zone: "{{ zone }}"
+      loop: [user, host]
+      register: sshcas
+
+    - name: Fleet token for ssh_host_cert
+      oriolrius.pki_manager.pki_manager:
+        action: ssh_token_mint
+        token_name: "roles-{{ run_id }}"
+        host_ca_id: "{{ sshcas.results[1].ca_id }}"
+        token_ops: [sign-host, get-principals]
+        zone: "{{ zone }}"
+      register: fleet
+
+    - name: Write the fixtures  # noqa: jinja[invalid] (registered vars)
+      ansible.builtin.copy:
+        dest: "{{ work_dir }}/fixtures.yml"
+        mode: "0600"
+        content: "{{ {'it_ca_id': ca.ca_id, 'it_zone': zone, 'it_fleet_token': fleet.token,
+                     'it_user_ca_key': sshcas.results[0].ssh_ca.opensshPublicKey,
+                     'it_p12_password': lookup('ansible.builtin.password', '/dev/null', length=24,
+                                               chars=['ascii_letters', 'digits'])} | to_nice_yaml }}"

@@ -17,9 +17,6 @@
 - name: Setup web server certificates
   hosts: webservers
   become: true
-  collections:
-    - oriolrius.pki_manager
-
   vars:
     # PKI Manager connection (use vault for secrets)
     pki_api_url: "{{ lookup('env', 'PKI_API_URL') }}"
@@ -46,7 +43,7 @@
           - "{{ ansible_default_ipv4.address }}"
         validity: 365
         notify:
-          - reload nginx
+          - Reload nginx
 
       # API endpoint certificate
       - name: "nginx-api"
@@ -55,10 +52,10 @@
         dns_names:
           - "api.example.com"
         notify:
-          - reload nginx
+          - Reload nginx
 
   handlers:
-    - name: reload nginx
+    - name: Reload nginx
       ansible.builtin.service:
         name: nginx
         state: reloaded
@@ -71,7 +68,7 @@
         update_cache: true
 
   roles:
-    - pki_host_setup
+    - oriolrius.pki_manager.pki_host_setup
 
   post_tasks:
     - name: Configure nginx SSL
@@ -81,7 +78,7 @@
         owner: root
         group: root
         mode: "0644"
-      notify: reload nginx
+      notify: Reload nginx
 
     - name: Show certificate paths
       ansible.builtin.debug:

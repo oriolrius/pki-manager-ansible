@@ -2,9 +2,9 @@
 
 **`oriolrius.pki_manager`** — an Ansible collection for managing **both X.509 certificates and the SSH certificate workflow** through the PKI Manager REST API (one module plus two host-setup roles).
 
-- **Version:** 3.0.1 (tested against PKI Manager 3.19.0)
+- **Version:** 3.1.0 (tested against PKI Manager 3.19.0)
 - **Collection (FQCN):** `oriolrius.pki_manager`
-- **Requires:** Ansible `>=2.14.0`, `community.crypto >=2.0.0`
+- **Requires:** ansible-core `>=2.15.0` (CI tests 2.17, 2.18, 2.19), `community.crypto >=2.0.0`
 - **Repository:** https://github.com/oriolrius/pki-manager-ansible
 
 ---
@@ -181,6 +181,20 @@ The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
 | `cert_download` | Download certificate in a format | `cert_id`, `download_format`, `download_password`, `download_dest` |
 | `cert_find` | Find the certificate with the serial of a PEM (needs Python `cryptography`) | `cert_pem` |
 
+### More X.509 actions
+
+| Action | Purpose | Key parameters |
+|---|---|---|
+| `ca_certs` | List the certificates of a CA (all pages) | `ca_id` |
+| `ca_download` | Download the CA certificate, truststore or keystore (idempotent with `download_dest`) | `ca_id`, `ca_download_format`, `download_password`, `download_dest` |
+| `crl_list` | List the CRLs of a CA | `ca_id` |
+| `crl_generate` | Generate a new CRL | `ca_id`, `crl_next_update_days` |
+| `crl_download` | Download the current CRL from the public distribution point (checks that it is a CRL) | `ca_id`, `crl_format` (`crl` PEM, `der`), `download_dest` |
+| `cert_bulk_renew` / `cert_bulk_revoke` / `cert_bulk_delete` | Renew, revoke or delete many certificates; fails when one item fails (see `bulk.results`) | `cert_ids` + the renew/revoke/delete options |
+| `domain_list` | Domain inventory | `search_query`, `ca_id` |
+| `audit_list` | Audit log entries | `audit_operation`, `audit_entity_type`, `audit_entity_id`, `audit_status`, `audit_start`, `audit_end`, `audit_limit` |
+| `report_generate` | Compliance report (CSV) | `report_type`, `ca_id`, `report_start`, `report_end`, `download_dest` |
+
 ### SSH actions
 
 | Action | Purpose | Key parameters |
@@ -209,6 +223,26 @@ The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
 | `ssh_get_principals` | Fetch host `auth_principals` (fleet-token) | `host_fqdn`, `fleet_token` |
 | `ssh_principals_pushed` | Acknowledge the installed principal files so the host is not Stale (fleet-token; 409 `SHA256_MISMATCH` fails with `sha256_mismatch`/`current_sha256`; no-op in check mode) | `host_fqdn`, `fleet_token`, `principals_sha256` |
 
+### More SSH actions
+
+| Action | Purpose | Key parameters |
+|---|---|---|
+| `ssh_ca_get` / `ssh_ca_rotate` / `ssh_ca_retire` / `ssh_ca_revoke` / `ssh_krl_generate` | SSH CA lifecycle | `ssh_ca_id`, `ssh_reason` (revoke) |
+| `ssh_host_get` / `ssh_host_issue` / `ssh_host_revoke` / `ssh_host_offboard` | Host lifecycle (admin) | `host_id`, `host_ca_id`, `host_valid_seconds`, `host_key_id`, `ssh_reason` |
+| `ssh_identity_disable` / `ssh_identity_offboard` | Identity lifecycle | `identity_id`, `ssh_reason` |
+| `ssh_principal_revoke_grant` / `ssh_principal_unmap` / `ssh_principal_delete` | Undo a grant or a mapping; delete a principal | `identity_id`, `principal_id`, `host_id`, `local_account` |
+| `ssh_token_revoke` | Revoke a fleet token | `token_id` |
+| `ssh_cert_revoke` | Revoke an SSH certificate | `ssh_cert_id`, `ssh_reason` |
+| `ssh_bulk_expiring` / `ssh_bulk_renew` / `ssh_bulk_revoke` | Bulk SSH lifecycle | `ssh_within_seconds` (default 30 days), `ssh_cert_ids`, `ssh_reason` |
+| `ssh_metrics` / `ssh_trust_anchors` | Health metrics; trust anchors of a zone | `zone` |
+| `ssh_zone_archive` / `ssh_zone_unarchive` | Archive or reactivate a zone | `zone` |
+
+### Any other operation: `api_request`
+
+`api_request` calls any REST operation with the module's authentication, 429 retry and error handling: `api_method`, `api_path` (relative to `api_url`, or to the server root with `api_public: true` for the public routes such as `/cas/<id>.pem`), `api_body` (dict, list or JSON string), `api_query`. It returns `status` and `json` (or `text`/`content` for a public route). `changed` is `false` for GET and `true` for the other methods (override with `api_changed`); check mode sends only GET requests.
+
+The state-changing named actions report `changed: true` and do nothing in check mode. They are not idempotent on their own (the server can refuse a second `ssh_ca_retire`): guard them with `when:` in a playbook.
+
 X.509 and SSH-admin actions hit `{api_url}/…` with the optional OIDC Bearer. Host-facing actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`, `ssh_principals_pushed`) hit `/external/ssh` with the `fleet_token` Bearer. `required_if` enforces per-action mandatory parameters (e.g. `ssh_sign_host` requires `host_fqdn` + `host_pubkey` + `fleet_token`).
 
 **SSH zones** (PKI Manager 3.11+, decision-017): `zone` takes a zone id or name. With one zone you can omit it. With two or more zones the server refuses the create actions without a zone (fail-closed), and the trust actions without `zone` return the DEFAULT zone only (old URLs). Always set `zone` on a multi-zone server. The fleet-token actions do not take `zone`: the token's zone applies.
@@ -230,6 +264,8 @@ X.509 and SSH-admin actions hit `{api_url}/…` with the optional OIDC Bearer. H
 | `validate_certs` | No | `true` | Verify the PKI Manager TLS certificate |
 | `ca_path` | No | — | PEM bundle to trust a server with a private CA (use it instead of `validate_certs: false`) |
 | `timeout` | No | `30` | Request timeout (seconds) |
+| `rate_limit_retries` | No | `0` | On HTTP 429, wait for `Retry-After` (seconds or HTTP date; 1, 2, 4 … s when absent) and retry this many times. `0` fails at once. The waits are returned in `rate_limit_waits` |
+| `rate_limit_max_wait` | No | `120` | The longest total wait (seconds) for 429 retries; a longer `Retry-After` fails at once |
 | `token_cache_path` | No | `~/.cache/pki-manager-ansible/token-<hash>.json` | OIDC token cache. The default name comes from `api_url`, `oidc_url` and `client_id`, so two servers or clients never share a token. The file is mode 0600 in a 0700 directory; the module ignores a cache file that another user owns, that others can read, or that was written for another server or client. A cached token that the server refuses (401) is dropped and the module logs in again once. |
 | `fleet_token` | No | — | `pkimg_…` bearer (`no_log`) for host-facing SSH actions |
 
@@ -240,10 +276,13 @@ When `api_token` and `oidc_url`/`client_id`/`client_secret` are absent, the modu
 - **X.509 CA** — `ca_id`, `ca_cn`/`ca_org`/`ca_country` (required for `ca_create`), optional `ca_ou`/`ca_state`/`ca_locality`, `ca_algorithm` (`RSA-2048|RSA-4096`, default `RSA-4096`; the API takes only RSA for a CA), `ca_validity_years` (1-30; server default 20). `ca_validity` (days) is deprecated: the module rounds it to years.
 - **X.509 certificate** — `cert_id`, `cert_cn`, `cert_org` and `cert_country` (required for `cert_issue`), optional `cert_ou`/`cert_state`/`cert_locality`, `cert_type` (default `server` for `cert_issue`; a filter for `cert_list`), `cert_status` (filter for `cert_list`), `cert_algorithm` (default `RSA-2048`), `cert_validity` (days, default `365`), SAN lists `cert_dns_names`/`cert_ip_addresses`/`cert_emails`.
 - **Downloads** — `download_format` (default `pem`): `pem`, `der`, `chain-pem`, `full-pem`, `full-der`, `key-pem`, `key-der`, `csr-pem`, `p12`, `pfx`, `pkcs8-pem`, `pkcs8-der`, `pkcs8-encrypted`, `jks-keystore`, `jks-truststore`. `download_password` is required for `p12`/`pfx`/`jks-keystore`/`jks-truststore`/`pkcs8-encrypted`. The password goes in the `X-Export-Password` header, never in the URL. `download_dest` is written `chmod 0600`; if omitted, content is returned base64-encoded. `chain-pem` is certificate + issuing CA and `full-pem` is certificate + **private key** + issuing CA (PKI Manager 3.19.1+; before, `chain-pem` had no CA and `full-pem` had no chain). Never write `full-pem` to a file that others can read. `download_dest` is idempotent: the same content with mode 0600 gives `changed: false`, and check mode reports the change without writing.
-- **Revocation** — `revocation_details` (free text) and `revocation_reason` (shared by `ca_revoke` and `cert_revoke`): `unspecified` (default), `keyCompromise`, `caCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`.
+- **Renewal** — `cert_renew` takes `cert_validity`, `renew_new_key` (`false` keeps the key), `revoke_original`, and new subject/SAN values (`cert_cn`, `cert_org`, `cert_country`, `cert_ou`, `cert_state`, `cert_locality`, `cert_dns_names`, `cert_ip_addresses`, `cert_emails`). Any of these sets `updateInfo`; PKI Manager 3.19.1+ keeps the subject fields you do not give (3.19.0 drops them: give CN, O and C together).
+- **Delete** — `destroy_key` (`ca_delete`, `cert_delete`; the server keeps a key another certificate uses) and `remove_from_crl` (`cert_delete`).
+- **Tags** — `tags` for `ca_create` and `cert_issue` (stored on the KMS objects).
+- **Revocation** — `revocation_details` (free text), `revocation_effective_date` (Unix time) and `generate_crl` (`cert_revoke`), and `revocation_reason` (shared by `ca_revoke` and `cert_revoke`): `unspecified` (default), `keyCompromise`, `caCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`.
 - **Lists** — `ca_list` and `cert_list` read every page, so `cas`/`certificates` hold all items (not only the first 50).
 - **Search / dashboards** — `search_query` (required for `search`), `search_limit` (default `10`), `expiring_limit` (default `5`, capped at `20`).
-- **SSH** — `ssh_ca_type` (`user|host`), `ssh_ca_label`; `token_name`, `token_ops` (e.g. `sign-host`/`get-principals`/`register-host-pubkey`), `host_ca_id`/`user_ca_id`; `identity_id`/`identity_subject`/`identity_email`/`identity_external_subject`; `principal_id`/`principal_name`/`principal_description`; `host_id`/`host_fqdn`/`host_pubkey`/`host_addresses`/`local_account`; `ssh_public_key`, `principals`, `user_valid_seconds` (`validForSeconds` of `ssh_user_issue`), `host_valid_seconds` and `host_key_id` (`ssh_sign_host`; `user_valid_seconds` is still accepted there when `host_valid_seconds` is not set), `enforce_entitlement`; `cert_authority_pattern` (default `*`), `block_reason`, `idempotency_key` (`Idempotency-Key` header for `ssh_sign_host`).
+- **SSH** — `ssh_ca_type` (`user|host`), `ssh_ca_label`; `token_name`, `token_ops` (e.g. `sign-host`/`get-principals`/`register-host-pubkey`), `host_ca_id`/`user_ca_id`; `identity_id`/`identity_subject`/`identity_email`/`identity_external_subject`; `principal_id`/`principal_name`/`principal_description`; `host_id`/`host_fqdn`/`host_pubkey`/`host_addresses`/`local_account`; `ssh_public_key`, `principals`, `user_valid_seconds` (`validForSeconds` of `ssh_user_issue`), `host_valid_seconds` and `host_key_id` (`ssh_sign_host`; `user_valid_seconds` is still accepted there when `host_valid_seconds` is not set), `enforce_entitlement`, `user_extensions` (`permit-pty`, `permit-port-forwarding`, …), `force_command`, `source_address`, `user_key_id` (`ssh_user_issue`); `allowed_principals` and `max_valid_seconds` (`ssh_token_mint`, only with the `sign-user` op); `cert_authority_pattern` (default `*`), `block_reason`, `idempotency_key` (`Idempotency-Key` header for `ssh_sign_host`).
 
 ---
 
@@ -315,20 +354,21 @@ Full docs: [`roles/ssh_host_cert/README.md`](roles/ssh_host_cert/README.md).
 
 ## Tests
 
+CI (`.github/workflows/ci.yml`) runs on every pull request:
+
+- **Lint**: `ansible-lint` (production profile) and `yamllint`.
+- **Sanity**: `ansible-test sanity` with ansible-core 2.17, 2.18 and 2.19.
+- **Integration**: `tests/integration/run.sh` starts a throwaway PKI Manager (backend image + Cosmian KMS, OIDC off), runs `tests/integration/module.yml` (the module against the real API, with asserts), then runs both roles twice on an Ubuntu 24.04 container. The second run must report `changed=0`.
+
+Run the integration tests locally (needs Docker, ansible-core, `community.crypto` and `community.docker`):
+
 ```bash
-export PKI_API_URL="https://pki.example.com/api/v1"
-export PKI_OIDC_URL="https://iam.example.com/realms/pki/protocol/openid-connect/token"
-export PKI_CLIENT_ID="your-client-id"
-export PKI_CLIENT_SECRET="your-client-secret"
-
-ansible-galaxy collection build
-ansible-galaxy collection install oriolrius-pki_manager-*.tar.gz --force
-
-ansible-playbook tests/test_module.yml       # X.509 CRUD/lifecycle smoke test
-ansible-playbook tests/test_ssh_module.yml   # every SSH action (unauthenticated + ECIES)
-ansible-playbook tests/test_role.yml         # pki_host_setup integration
-ansible-playbook tests/test_role_syntax.yml  # offline --check structural validation
+tests/integration/run.sh                               # PKI Manager 3.19.0 on 127.0.0.1:3000
+PKI_IMAGE_TAG=3.19.1 PKI_PORT=47500 tests/integration/run.sh
+KEEP=1 tests/integration/run.sh                        # leave the stack up to debug
 ```
+
+`tests/test_role_syntax.yml` is an offline `--check` run of the role structure.
 
 ---
 

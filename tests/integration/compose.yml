@@ -1,0 +1,34 @@
+---
+# A throwaway PKI Manager for the integration tests (tests/integration/run.sh).
+# OIDC is off and the SSH CA accepts unauthenticated admin calls: test data only.
+name: pki-ansible-it
+
+services:
+  kms:
+    image: ghcr.io/cosmian/kms:${KMS_IMAGE_TAG:-5.28.0}
+    environment:
+      - COSMIAN_KMS_CONF=/etc/cosmian/kms.toml
+    volumes:
+      - ./kms.toml:/etc/cosmian/kms.toml:ro
+    tmpfs:
+      - /cosmian-kms/sqlite-data
+      - /tmp
+
+  backend:
+    image: ghcr.io/oriolrius/pki-manager-web/backend:${PKI_IMAGE_TAG:-3.19.0}
+    depends_on:
+      - kms
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      - DATABASE_PATH=/app/backend/data/pki.db
+      - KMS_URL=http://kms:9998
+      - CRL_DISTRIBUTION_URL=http://localhost:${PKI_PORT:-3000}/crl
+      - ALLOW_UNAUTHENTICATED_SSH_CA=true
+      - ALLOW_CA_KEY_EXPORT=false
+    ports:
+      - "127.0.0.1:${PKI_PORT:-3000}:3000"
+    tmpfs:
+      - /app/backend/data:mode=1777   # the backend does not run as root
+      - /tmp
