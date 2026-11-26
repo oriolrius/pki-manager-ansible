@@ -184,29 +184,33 @@ The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
 
 | Action | Purpose | Key parameters |
 |---|---|---|
-| `ssh_ca_create` | Create SSH user/host CA | `ssh_ca_type`, `ssh_ca_label` |
-| `ssh_ca_list` | List SSH CAs | — |
-| `ssh_token_mint` | Mint fleet bearer token | `token_name`, `token_ops`, `host_ca_id`/`user_ca_id` |
-| `ssh_identity_create` | Create SSH identity | `identity_subject`, `identity_email` |
-| `ssh_principal_create` | Create SSH principal | `principal_name`, `principal_description` |
+| `ssh_zone_list` | List SSH zones | — |
+| `ssh_zone_create` | Create an SSH zone (no change when it exists) | `zone` (the name), `zone_display_name`, `zone_description` |
+| `ssh_ca_create` | Create SSH user/host CA | `ssh_ca_type`, `ssh_ca_label`, `zone` |
+| `ssh_ca_list` | List SSH CAs | `zone` |
+| `ssh_token_mint` | Mint fleet bearer token | `token_name`, `token_ops`, `host_ca_id`/`user_ca_id`, `zone` |
+| `ssh_identity_create` | Create SSH identity | `identity_subject`, `identity_email`, `identity_external_subject`, `zone` |
+| `ssh_principal_create` | Create SSH principal | `principal_name`, `principal_description`, `zone` |
 | `ssh_principal_grant` | Grant principal to identity | `identity_id`, `principal_id` |
 | `ssh_principal_map` | Map principal to local account | `host_id`, `principal_id`, `local_account` |
 | `ssh_user_issue` | Issue SSH user certificate | `identity_id`, `ssh_public_key`, `principals`, `user_valid_seconds` |
-| `ssh_host_register` | Register SSH host pubkey | `host_fqdn`, `host_pubkey`, `host_addresses` |
-| `ssh_host_list` | List / resolve SSH hosts | `host_fqdn` |
+| `ssh_host_register` | Register SSH host pubkey | `host_fqdn`, `host_pubkey`, `host_addresses`, `zone` |
+| `ssh_host_list` | List / resolve SSH hosts | `host_fqdn`, `zone` |
 | `ssh_block` | Block identity on host | `host_id`, `identity_id`, `block_reason` |
 | `ssh_unblock` | Unblock identity on host | `host_id`, `identity_id` |
 | `ssh_auth_principals` | Render host `auth_principals` file | `host_id` |
 | `ssh_sshd_config` | Render sshd drop-in config | `host_id` |
-| `ssh_cert_authority` | Fetch `@cert-authority` known_hosts line | `cert_authority_pattern` |
-| `ssh_trusted_user_ca` | Fetch `TrustedUserCAKeys` content | — |
-| `ssh_host_ca` | Fetch host-CA trust anchor | — |
+| `ssh_cert_authority` | Fetch `@cert-authority` known_hosts line | `cert_authority_pattern`, `zone` |
+| `ssh_trusted_user_ca` | Fetch `TrustedUserCAKeys` content | `zone` |
+| `ssh_host_ca` | Fetch host-CA trust anchor | `zone` |
 | `ssh_sign_host` | Sign host cert (fleet-token) | `host_fqdn`, `host_pubkey`, `fleet_token`, `host_valid_seconds`, `host_key_id`, `idempotency_key` |
 | `ssh_register_host_pubkey` | Register ECIES host key (fleet-token) | `host_fqdn`, `fleet_token` |
 | `ssh_get_principals` | Fetch host `auth_principals` (fleet-token) | `host_fqdn`, `fleet_token` |
 | `ssh_principals_pushed` | Acknowledge the installed principal files so the host is not Stale (fleet-token; 409 `SHA256_MISMATCH` fails with `sha256_mismatch`/`current_sha256`; no-op in check mode) | `host_fqdn`, `fleet_token`, `principals_sha256` |
 
 X.509 and SSH-admin actions hit `{api_url}/…` with the optional OIDC Bearer. Host-facing actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`, `ssh_principals_pushed`) hit `/external/ssh` with the `fleet_token` Bearer. `required_if` enforces per-action mandatory parameters (e.g. `ssh_sign_host` requires `host_fqdn` + `host_pubkey` + `fleet_token`).
+
+**SSH zones** (PKI Manager 3.11+, decision-017): `zone` takes a zone id or name. With one zone you can omit it. With two or more zones the server refuses the create actions without a zone (fail-closed), and the trust actions without `zone` return the DEFAULT zone only (old URLs). Always set `zone` on a multi-zone server. The fleet-token actions do not take `zone`: the token's zone applies.
 
 ---
 
@@ -279,6 +283,7 @@ Provisions a full SSH-CA node from the PKI Manager external REST API in a single
 |---|---|---|
 | `ssh_ca_base_url` | `https://pki.internal` | PKI Manager base URL |
 | `ssh_ca_fleet_token` | `""` | **Must be vaulted** — `pkimg_…` token scoped to one Host CA (ops `sign-host`, `get-principals`, and ECIES `register-host-pubkey`) |
+| `ssh_host_cert_zone` | `""` | SSH zone (id or name) of the fleet token. **Required with two or more zones**: empty installs the DEFAULT zone's User CA, Host CA and `@cert-authority` trust |
 | `ssh_host_cert_ecies_enabled` | `false` | Master switch for the encrypted-KRL path (forces an `ecdsa-sha2-nistp256` host key) |
 | `ssh_host_cert_key_type` | `ecdsa` | Host key algorithm: the backend accepts only `ecdsa-sha2-nistp256` host keys |
 | `ssh_host_cert_renew_enabled` | `true` | Unattended renewal (stores the fleet token `0600` on the host) |

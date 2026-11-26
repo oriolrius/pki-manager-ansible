@@ -60,6 +60,8 @@ options:
             - ssh_register_host_pubkey
             - ssh_get_principals
             - ssh_principals_pushed
+            - ssh_zone_list
+            - ssh_zone_create
     api_url:
         description:
             - PKI Manager API URL.
@@ -372,6 +374,23 @@ options:
         type: str
     idempotency_key:
         description: Idempotency-Key header for ssh_sign_host.
+        type: str
+    zone:
+        description:
+            - SSH zone, by id or name (decision-017 multi-tenant SSH).
+            - Sent with ssh_ca_create, ssh_token_mint, ssh_identity_create, ssh_principal_create and ssh_host_register.
+              With two or more zones the server refuses these without a zone (fail-closed).
+            - Filters ssh_ca_list and ssh_host_list.
+            - Selects the zone of ssh_trusted_user_ca, ssh_host_ca and ssh_cert_authority
+              (C(/ssh/zones/<zone>/...)). Without it they return the DEFAULT zone only (old, deprecated URLs).
+            - Name of the new zone for ssh_zone_create.
+            - Not used by the fleet-token actions; the fleet token sets the zone there.
+        type: str
+    zone_display_name:
+        description: Display name for ssh_zone_create.
+        type: str
+    zone_description:
+        description: Description for ssh_zone_create.
         type: str
 author:
     - Oriol Rius (@oriolrius)
@@ -1053,25 +1072,72 @@ class PKIManagerClient:
         except Exception as e:
             return self._err(e)
 
+    # ============================ SSH zones ============================
+    def zone_id(self, zone):
+        """Resolve a zone id or name to its id (the list filters need the id)."""
+        r = self.get(f"/ssh/zones/{quote(zone, safe='')}")
+        if r['error']:
+            self.module.fail_json(msg=f"SSH zone '{zone}' not found: {r['error']}")
+        return r['data']['id']
+
+    def ssh_zone_list(self):
+        r = self.get('/ssh/zones')
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        zones = r['data'] if isinstance(r['data'], list) else (r['data'] or {}).get('items', [])
+        return {'changed': False, 'ssh_zones': zones, 'msg': f"Found {len(zones)} SSH zones"}
+
+    def ssh_zone_create(self, name, display_name=None, description=None):
+        r = self.get(f"/ssh/zones/{quote(name, safe='')}")
+        if not r['error']:
+            return {'changed': False, 'ssh_zone': r['data'], 'zone_id': r['data']['id'],
+                    'msg': f"SSH zone {name} exists"}
+        payload = {'name': name, 'displayName': display_name or name}
+        if description:
+            payload['description'] = description
+        r = self.post('/ssh/zones', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': True, 'ssh_zone': r['data'], 'zone_id': r['data']['id'],
+                'msg': f"Created SSH zone {name}"}
+
+    @staticmethod
+    def _zone_path(path, zone):
+        """The zone-scoped public trust URL, or the old default-zone URL."""
+        if not zone:
+            return path
+        return path.replace('/ssh/', f"/ssh/zones/{quote(zone, safe='')}/", 1)
+
+    @staticmethod
+    def _trust_error(r, zone):
+        msg = r['error']
+        if zone and r['status'] == 404:
+            msg = f"SSH zone '{zone}' not found"
+        return {'changed': False, 'failed': True, 'msg': msg}
+
     # ===================== SSH admin / operator actions =====================
-    def ssh_ca_create(self, ca_type, label=None):
+    def ssh_ca_create(self, ca_type, label=None, zone=None):
         payload = {'caType': ca_type}
         if label:
             payload['label'] = label
+        if zone:
+            payload['zone'] = zone
         r = self.post('/ssh/cas', payload)
         if r['error']:
             return {'changed': False, 'failed': True, 'msg': r['error']}
         return {'changed': True, 'ssh_ca': r['data'], 'ca_id': r['data']['id'],
                 'msg': f"Created SSH {ca_type} CA {r['data']['id']}"}
 
-    def ssh_ca_list(self):
-        r = self.get('/ssh/cas')
+    def ssh_ca_list(self, zone=None):
+        r = self.get('/ssh/cas', params={'zoneId': self.zone_id(zone)} if zone else None)
         if r['error']:
             return {'changed': False, 'failed': True, 'msg': r['error']}
         return {'changed': False, 'ssh_cas': r['data'], 'msg': f"Found {len(r['data'])} SSH CAs"}
 
-    def ssh_token_mint(self, name, host_ca_id=None, user_ca_id=None, ops=None):
+    def ssh_token_mint(self, name, host_ca_id=None, user_ca_id=None, ops=None, zone=None):
         payload = {'name': name, 'opSet': ops or []}
+        if zone:
+            payload['zone'] = zone
         if host_ca_id:
             payload['hostCaId'] = host_ca_id
         if user_ca_id:
@@ -1082,8 +1148,10 @@ class PKIManagerClient:
         return {'changed': True, 'token': r['data']['token'], 'ssh_token': r['data']['record'],
                 'msg': f"Minted fleet token {r['data']['record']['id']}"}
 
-    def ssh_identity_create(self, subject, email=None, external_subject=None):
+    def ssh_identity_create(self, subject, email=None, external_subject=None, zone=None):
         payload = {'subject': subject}
+        if zone:
+            payload['zone'] = zone
         if email:
             payload['email'] = email
         if external_subject:
@@ -1094,8 +1162,10 @@ class PKIManagerClient:
         return {'changed': True, 'ssh_identity': r['data'], 'identity_id': r['data']['id'],
                 'msg': f"Created SSH identity {subject}"}
 
-    def ssh_principal_create(self, name, description=None):
+    def ssh_principal_create(self, name, description=None, zone=None):
         payload = {'name': name}
+        if zone:
+            payload['zone'] = zone
         if description:
             payload['description'] = description
         r = self.post('/ssh/principals', payload)
@@ -1132,16 +1202,23 @@ class PKIManagerClient:
         return {'changed': True, 'ssh_certificate': r['data'], 'cert_openssh': cert.get('certOpenssh'),
                 'msg': f"Issued SSH user cert for identity {identity_id}"}
 
-    def ssh_host_register(self, fqdn, ssh_public_key, addresses=None):
+    def ssh_host_register(self, fqdn, ssh_public_key, addresses=None, zone=None):
         payload = {'fqdn': fqdn, 'opensshHostPubkey': ssh_public_key, 'addresses': addresses or []}
+        if zone:
+            payload['zone'] = zone
         r = self.post('/ssh/hosts', payload)
         if r['error']:
             return {'changed': False, 'failed': True, 'msg': r['error']}
         return {'changed': True, 'ssh_host': r['data'], 'host_id': r['data']['id'],
                 'msg': f"Registered SSH host {fqdn}"}
 
-    def ssh_host_list(self, fqdn=None):
-        r = self.get('/ssh/hosts', params={'fqdn': fqdn} if fqdn else None)
+    def ssh_host_list(self, fqdn=None, zone=None):
+        params = {}
+        if fqdn:
+            params['fqdn'] = fqdn
+        if zone:
+            params['zoneId'] = self.zone_id(zone)
+        r = self.get('/ssh/hosts', params=params or None)
         if r['error']:
             return {'changed': False, 'failed': True, 'msg': r['error']}
         hosts = r['data'] or []
@@ -1182,23 +1259,23 @@ class PKIManagerClient:
         return {'changed': False, 'sshd_config': r['text'],
                 'msg': f"Rendered sshd drop-in for host {host_id}"}
 
-    def ssh_cert_authority(self, pattern='*'):
-        r = self._get_text(f"/ssh/cert-authority?pattern={quote(pattern)}")
+    def ssh_cert_authority(self, pattern='*', zone=None):
+        r = self._get_text(self._zone_path(f"/ssh/cert-authority?pattern={quote(pattern)}", zone))
         if r['error']:
-            return {'changed': False, 'failed': True, 'msg': r['error']}
+            return self._trust_error(r, zone)
         return {'changed': False, 'cert_authority': (r['text'] or '').strip(),
                 'msg': "Fetched @cert-authority line"}
 
-    def ssh_trusted_user_ca(self):
-        r = self._get_text('/ssh/trusted-user-ca-keys')
+    def ssh_trusted_user_ca(self, zone=None):
+        r = self._get_text(self._zone_path('/ssh/trusted-user-ca-keys', zone))
         if r['error']:
-            return {'changed': False, 'failed': True, 'msg': r['error']}
+            return self._trust_error(r, zone)
         return {'changed': False, 'trusted_user_ca_keys': r['text'], 'msg': "Fetched TrustedUserCAKeys"}
 
-    def ssh_host_ca(self):
-        r = self._get_text('/ssh/host-ca-keys')
+    def ssh_host_ca(self, zone=None):
+        r = self._get_text(self._zone_path('/ssh/host-ca-keys', zone))
         if r['error']:
-            return {'changed': False, 'failed': True, 'msg': r['error']}
+            return self._trust_error(r, zone)
         return {'changed': False, 'host_ca_keys': r['text'], 'msg': "Fetched Host-CA trust anchor"}
 
     # =================== SSH host-facing actions (fleet token) ==============
@@ -1268,6 +1345,8 @@ def run_module():
             # SSH workflow — host-facing (fleet-token)
             'ssh_sign_host', 'ssh_register_host_pubkey', 'ssh_get_principals',
             'ssh_principals_pushed',
+            # SSH zones
+            'ssh_zone_list', 'ssh_zone_create',
         ]),
         api_url=dict(type='str', required=True),
         # OIDC is optional: omit for a backend with OIDC disabled
@@ -1350,6 +1429,9 @@ def run_module():
         block_reason=dict(type='str'),
         idempotency_key=dict(type='str'),
         fleet_token=dict(type='str', no_log=True),
+        zone=dict(type='str'),
+        zone_display_name=dict(type='str'),
+        zone_description=dict(type='str'),
         # Connection
         validate_certs=dict(type='bool', default=True),
         timeout=dict(type='int', default=30),
@@ -1389,6 +1471,7 @@ def run_module():
             ('action', 'ssh_register_host_pubkey', ['host_fqdn', 'fleet_token']),
             ('action', 'ssh_get_principals', ['host_fqdn', 'fleet_token']),
             ('action', 'ssh_principals_pushed', ['host_fqdn', 'fleet_token', 'principals_sha256']),
+            ('action', 'ssh_zone_create', ['zone']),
         ],
     )
 
@@ -1552,10 +1635,10 @@ def run_module():
         if module.check_mode:
             result = {'changed': True, 'msg': 'SSH CA would be created (check mode)'}
         else:
-            result = client.ssh_ca_create(module.params['ssh_ca_type'], module.params.get('ssh_ca_label'))
+            result = client.ssh_ca_create(module.params['ssh_ca_type'], module.params.get('ssh_ca_label'), module.params.get('zone'))
 
     elif action == 'ssh_ca_list':
-        result = client.ssh_ca_list()
+        result = client.ssh_ca_list(module.params.get('zone'))
 
     elif action == 'ssh_token_mint':
         if module.check_mode:
@@ -1566,6 +1649,7 @@ def run_module():
                 host_ca_id=module.params.get('host_ca_id'),
                 user_ca_id=module.params.get('user_ca_id'),
                 ops=module.params.get('token_ops'),
+                zone=module.params.get('zone'),
             )
 
     elif action == 'ssh_identity_create':
@@ -1576,13 +1660,14 @@ def run_module():
                 module.params['identity_subject'],
                 module.params.get('identity_email'),
                 module.params.get('identity_external_subject'),
+                module.params.get('zone'),
             )
 
     elif action == 'ssh_principal_create':
         if module.check_mode:
             result = {'changed': True, 'msg': 'SSH principal would be created (check mode)'}
         else:
-            result = client.ssh_principal_create(module.params['principal_name'], module.params.get('principal_description'))
+            result = client.ssh_principal_create(module.params['principal_name'], module.params.get('principal_description'), module.params.get('zone'))
 
     elif action == 'ssh_principal_grant':
         if module.check_mode:
@@ -1613,10 +1698,11 @@ def run_module():
         if module.check_mode:
             result = {'changed': True, 'msg': 'SSH host would be registered (check mode)'}
         else:
-            result = client.ssh_host_register(module.params['host_fqdn'], module.params['host_pubkey'], module.params.get('host_addresses'))
+            result = client.ssh_host_register(module.params['host_fqdn'], module.params['host_pubkey'],
+                                              module.params.get('host_addresses'), module.params.get('zone'))
 
     elif action == 'ssh_host_list':
-        result = client.ssh_host_list(module.params.get('host_fqdn'))
+        result = client.ssh_host_list(module.params.get('host_fqdn'), module.params.get('zone'))
 
     elif action == 'ssh_block':
         if module.check_mode:
@@ -1637,13 +1723,13 @@ def run_module():
         result = client.ssh_sshd_config(module.params['host_id'])
 
     elif action == 'ssh_cert_authority':
-        result = client.ssh_cert_authority(module.params.get('cert_authority_pattern', '*'))
+        result = client.ssh_cert_authority(module.params.get('cert_authority_pattern', '*'), module.params.get('zone'))
 
     elif action == 'ssh_trusted_user_ca':
-        result = client.ssh_trusted_user_ca()
+        result = client.ssh_trusted_user_ca(module.params.get('zone'))
 
     elif action == 'ssh_host_ca':
-        result = client.ssh_host_ca()
+        result = client.ssh_host_ca(module.params.get('zone'))
 
     elif action == 'ssh_sign_host':
         if module.check_mode:
@@ -1673,6 +1759,16 @@ def run_module():
             result = {'changed': True, 'msg': 'Principal push would be acknowledged (check mode)'}
         else:
             result = client.ssh_principals_pushed(module.params['host_fqdn'], module.params['principals_sha256'])
+
+    elif action == 'ssh_zone_list':
+        result = client.ssh_zone_list()
+
+    elif action == 'ssh_zone_create':
+        if module.check_mode:
+            result = {'changed': True, 'msg': 'SSH zone would be created (check mode)'}
+        else:
+            result = client.ssh_zone_create(module.params['zone'], module.params.get('zone_display_name'),
+                                            module.params.get('zone_description'))
 
     # Return result
     if result.get('failed'):

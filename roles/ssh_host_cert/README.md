@@ -31,6 +31,7 @@ once on `409 SHA256_MISMATCH`) → install unattended renewal →
 |---|---|---|
 | `ssh_ca_base_url` | `https://pki.internal` | PKI Manager base URL |
 | `ssh_ca_fleet_token` | `""` | fleet bearer token (**vault this**) |
+| `ssh_host_cert_zone` | `""` | SSH zone (id or name) of the fleet token. Required with two or more zones; empty installs the DEFAULT zone's trust anchors |
 | `ssh_host_cert_ecies_enabled` | `false` | ecdsa host key + register + `krl-client` puller |
 | `ssh_host_cert_krl_client_url` | `""` | `krl-client` binary source (https or `file:///`) |
 | `ssh_host_cert_krl_client_checksum` | `""` | `sha256:…` (idempotence + tamper guard) |
