@@ -36,6 +36,8 @@
     _cert_id: ""
     _cert_changed: false
     _cert_revoke_old: {}
+    _cert_found_old: {}
+    _cert_old_pem: {}
 
 - name: "Check the Common Name: {{ _cert_name }}"
   ansible.builtin.assert:
@@ -85,10 +87,24 @@
        if _cert_format == 'pem' else [pki_key_dir + '/' + _cert_p12_filename] }}
   register: _cert_files
 
+# Before 3.0.1 the role wrote the REST "full-pem" download (certificate + PRIVATE
+# KEY) to <name>-fullchain.crt with mode 0644: every local user could read the
+# key. Find such a file: the key is exposed, so the certificate is replaced and
+# revoked with reason keyCompromise.
+- name: "Read the installed fullchain file: {{ _cert_name }}"
+  ansible.builtin.slurp:
+    src: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}"
+  register: _cert_fullchain_raw
+  failed_when: false
+  when: _cert_format == 'pem'
+
 - name: "Decide whether to issue a new certificate: {{ _cert_name }}"
   ansible.builtin.set_fact:
     _cert_state: "{{ (_cert_state_raw.content | b64decode | from_json) if (_cert_state_raw.content is defined) else {} }}"
     _cert_files_ok: "{{ _cert_files.results | map(attribute='stat.exists') | min }}"
+    _cert_key_exposed: >-
+      {{ (_cert_fullchain_raw.content is defined)
+         and ('PRIVATE KEY' in (_cert_fullchain_raw.content | b64decode)) }}
 
 - name: "Compute the reason for a new certificate: {{ _cert_name }}"
   ansible.builtin.set_fact:
@@ -96,7 +112,8 @@
       {{ (((_cert_state.not_after | to_datetime('%Y-%m-%dT%H:%M:%S.%fZ')) - now(utc=true)).days)
          if (_cert_state.not_after | default('')) | length > 0 else -1 }}
     _cert_issue_reason: >-
-      {{ 'force' if _cert_force
+      {{ 'private key in the fullchain file' if _cert_key_exposed | bool
+         else 'force' if _cert_force
          else 'no state' if (_cert_state.cert_id | default('')) | length == 0
          else 'request changed' if _cert_state.request_hash | default('') != _cert_request_hash
          else 'file missing' if not (_cert_files_ok | bool)
@@ -137,6 +154,13 @@
       ca_path: "{{ pki_ca_path | default(omit, true) }}"
       validate_certs: "{{ pki_validate_certs }}"
   block:
+    - name: "Read the certificate that will be replaced: {{ _cert_name }}"
+      ansible.builtin.slurp:
+        src: "{{ pki_cert_dir }}/{{ _cert_filename }}"
+      register: _cert_old_pem
+      failed_when: false
+      when: _cert_format == 'pem'
+
     - name: "Issue certificate: {{ _cert_name }}"
       oriolrius.pki_manager.pki_manager:
         action: cert_issue
@@ -173,9 +197,9 @@
             cert_id: "{{ _cert_issued.cert_id }}"
             download_format: "{{ item }}"
             download_dest: "{{ _cert_tmp.path }}/{{ item }}"
-          # No chain-pem: the REST API returns only the leaf for it. The chain
-          # file is written from the CA certificate below (root CAs only).
-          loop: [pem, key-pem, full-pem]
+          # The chain and fullchain files are built from the certificate and the
+          # CA certificate below. Never from "full-pem": it has the private key.
+          loop: [pem, key-pem]
           delegate_to: localhost
           become: false
 
@@ -189,17 +213,24 @@
           loop:
             - { src: pem, dest: "{{ pki_cert_dir }}/{{ _cert_filename }}", group: "{{ _cert_group }}", mode: "0644" }
             - { src: key-pem, dest: "{{ pki_key_dir }}/{{ _cert_key_filename }}", group: "{{ _cert_key_group }}", mode: "0640" }
-            - { src: full-pem, dest: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}", group: "{{ _cert_group }}", mode: "0644" }
           loop_control:
             label: "{{ item.dest }}"
 
-        - name: "Install the CA chain file: {{ _cert_name }}"
+        - name: "Install the chain and fullchain files: {{ _cert_name }}"
           ansible.builtin.copy:
-            content: "{{ _pki_ca_info.ca.certificatePem | trim }}\n"
-            dest: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
+            content: "{{ item.content }}"
+            dest: "{{ item.dest }}"
             owner: "{{ _cert_owner }}"
             group: "{{ _cert_group }}"
             mode: "0644"
+          loop:
+            # chain = the issuing CA; fullchain = certificate + issuing CA (no key).
+            - dest: "{{ pki_cert_dir }}/{{ _cert_chain_filename }}"
+              content: "{{ _pki_ca_info.ca.certificatePem | trim }}\n"
+            - dest: "{{ pki_cert_dir }}/{{ _cert_fullchain_filename }}"
+              content: "{{ lookup('ansible.builtin.file', _cert_tmp.path + '/pem') | trim }}\n{{ _pki_ca_info.ca.certificatePem | trim }}\n"
+          loop_control:
+            label: "{{ item.dest }}"
 
     - name: Download and install the PKCS#12 file
       when: _cert_format in ['p12', 'pfx']
@@ -233,26 +264,46 @@
         group: root
         mode: "0644"
 
+    # A host set up before 3.0.0 has no state file: find the replaced
+    # certificate by the serial of the installed PEM.
+    - name: "Find the replaced certificate by its serial: {{ _cert_name }}"
+      oriolrius.pki_manager.pki_manager:
+        action: cert_find
+        cert_pem: "{{ _cert_old_pem.content | b64decode }}"
+      register: _cert_found_old
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      when:
+        - (_cert_state.cert_id | default('')) | length == 0
+        - _cert_old_pem.content is defined
+
     - name: "Revoke the replaced certificate: {{ _cert_name }}"
       oriolrius.pki_manager.pki_manager:
         action: cert_revoke
-        cert_id: "{{ _cert_state.cert_id }}"
-        revocation_reason: superseded
+        cert_id: "{{ _cert_old_id }}"
+        revocation_reason: "{{ 'keyCompromise' if _cert_key_exposed | bool else 'superseded' }}"
+        revocation_details: "{{ 'pki_host_setup: the private key was in ' + pki_cert_dir + '/' + _cert_fullchain_filename + ' (mode 0644)' if _cert_key_exposed | bool else omit }}"
+      vars:
+        _cert_old_id: "{{ _cert_state.cert_id | default(_cert_found_old.certificate.id | default('')) }}"
       register: _cert_revoke_old
       failed_when: false
       delegate_to: localhost
       become: false
       when:
-        - pki_revoke_replaced | bool
-        - (_cert_state.cert_id | default('')) | length > 0
-        - _cert_state.cert_id != _cert_issued.cert_id
+        - pki_revoke_replaced | bool or _cert_key_exposed | bool
+        - (_cert_state.cert_id | default(_cert_found_old.certificate.id | default(''))) | length > 0
+        - (_cert_state.cert_id | default(_cert_found_old.certificate.id | default(''))) != _cert_issued.cert_id
 
     - name: "Warn when the replaced certificate was not revoked: {{ _cert_name }}"
       ansible.builtin.debug:
-        msg: "The replaced certificate {{ _cert_state.cert_id }} was not revoked: {{ _cert_revoke_old.msg | default('') }}"
-      when:
-        - _cert_revoke_old is not skipped
-        - _cert_revoke_old.failed | default(false)
+        msg: >-
+          The replaced certificate was not revoked:
+          {{ _cert_revoke_old.msg | default(_cert_found_old.msg | default('it was not found on the server')) }}.
+          {{ 'Its private key was readable by every local user: revoke it by hand.' if _cert_key_exposed | bool else '' }}
+      when: >-
+        (_cert_revoke_old.failed | default(false))
+        or (_cert_key_exposed | bool and _cert_revoke_old is skipped)
 
     - name: Mark the certificate as new
       ansible.builtin.set_fact:

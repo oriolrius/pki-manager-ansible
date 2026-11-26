@@ -39,6 +39,7 @@ options:
             - cert_revoke
             - cert_delete
             - cert_download
+            - cert_find
             - ssh_ca_create
             - ssh_ca_list
             - ssh_token_mint
@@ -213,9 +214,19 @@ options:
             - certificateHold
             - removeFromCRL
         default: 'unspecified'
+    revocation_details:
+        description: Free-text detail recorded with the revocation (cert_revoke, ca_revoke).
+        type: str
+    cert_pem:
+        description:
+            - PEM of a certificate for cert_find. The module reads its serial number (Python C(cryptography))
+              and returns the certificate with that serial.
+        type: str
     download_format:
         description:
             - Certificate download format.
+            - V(chain-pem) is certificate + issuing CA, V(full-pem) is certificate + private key + issuing CA
+              (PKI Manager 3.19.1 and later; before, chain-pem had no CA and full-pem had no chain).
         type: str
         choices:
             - pem
@@ -241,7 +252,8 @@ options:
         type: str
     download_dest:
         description:
-            - Destination path for downloaded certificate.
+            - Destination path for downloaded certificate (written with mode 0600).
+            - When the file already has the same content and mode, nothing changes (C(changed=false)).
         type: path
     search_query:
         description:
@@ -870,9 +882,12 @@ class PKIManagerClient:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {'changed': False, 'ca': result['data'], 'msg': f"Retrieved CA {ca_id}"}
 
-    def ca_revoke(self, ca_id, reason='unspecified'):
+    def ca_revoke(self, ca_id, reason='unspecified', details=None):
         """Revoke a CA."""
-        result = self.post(f'/cas/{ca_id}/revoke', {'reason': reason})
+        payload = {'reason': reason}
+        if details:
+            payload['details'] = details
+        result = self.post(f'/cas/{ca_id}/revoke', payload)
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {'changed': True, 'msg': f"CA {ca_id} revoked with reason: {reason}"}
@@ -967,9 +982,12 @@ class PKIManagerClient:
             'msg': f"Certificate renewed, new ID: {result['data']['id']}",
         }
 
-    def cert_revoke(self, cert_id, reason='unspecified'):
+    def cert_revoke(self, cert_id, reason='unspecified', details=None):
         """Revoke a certificate."""
-        result = self.post(f'/certificates/{cert_id}/revoke', {'reason': reason})
+        payload = {'reason': reason}
+        if details:
+            payload['details'] = details
+        result = self.post(f'/certificates/{cert_id}/revoke', payload)
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {'changed': True, 'msg': f"Certificate {cert_id} revoked with reason: {reason}"}
@@ -985,6 +1003,29 @@ class PKIManagerClient:
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {'changed': True, 'msg': f"Certificate {cert_id} deleted"}
+
+    def cert_find(self, cert_pem):
+        """Find the certificate whose serial is the serial of cert_pem."""
+        try:
+            from cryptography import x509
+        except ImportError:
+            return {'changed': False, 'failed': True,
+                    'msg': 'cert_find needs the Python cryptography library where the module runs'}
+        try:
+            cert = x509.load_pem_x509_certificate(cert_pem.strip().encode('utf-8'))
+        except ValueError as e:
+            return {'changed': False, 'failed': True, 'msg': f"cert_pem is not a PEM certificate: {e}"}
+        serial = format(cert.serial_number, 'x')
+        result = self.get('/certificates/', params={'search': serial, 'limit': 100})
+        if result['error']:
+            return {'changed': False, 'failed': True, 'msg': result['error']}
+        norm = serial.lstrip('0').lower()
+        for item in (result['data'] or {}).get('items', []):
+            if str(item.get('serialNumber', '')).lstrip('0').lower() == norm:
+                return {'changed': False, 'certificate': item, 'cert_id': item['id'],
+                        'msg': f"Found certificate {item['id']} with serial {serial}"}
+        return {'changed': False, 'failed': True, 'serial_number': serial,
+                'msg': f"No certificate with serial {serial} on the server"}
 
     def cert_download(self, cert_id, format='pem', password=None, dest=None):
         """Download a certificate."""
@@ -1004,9 +1045,26 @@ class PKIManagerClient:
 
         if dest:
             try:
-                with open(dest, 'wb') as f:
-                    f.write(content)
-                os.chmod(dest, 0o600)
+                if os.path.isfile(dest) and not os.path.islink(dest):
+                    with open(dest, 'rb') as f:
+                        same = f.read() == content
+                    if same and (os.stat(dest).st_mode & 0o777) == 0o600:
+                        return {'changed': False, 'downloaded_file': dest, 'filename': filename,
+                                'msg': f"{dest} is up to date"}
+                if self.module.check_mode:
+                    return {'changed': True, 'downloaded_file': dest, 'filename': filename,
+                            'msg': f"{dest} would be written (check mode)"}
+                # Write a 0600 temp file in the same directory, then rename: no
+                # moment with the content in a file that others can read.
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dest)), prefix='.pki-')
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        f.write(content)
+                    os.replace(tmp, dest)
+                except BaseException:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
                 return {
                     'changed': True,
                     'downloaded_file': dest,
@@ -1336,6 +1394,7 @@ def run_module():
             'auth_test', 'stats', 'expiring', 'search',
             'ca_create', 'ca_list', 'ca_get', 'ca_revoke', 'ca_delete',
             'cert_issue', 'cert_list', 'cert_get', 'cert_renew', 'cert_revoke', 'cert_delete', 'cert_download',
+            'cert_find',
             # SSH workflow — admin/operator (OIDC or unauthenticated)
             'ssh_ca_create', 'ssh_ca_list', 'ssh_token_mint',
             'ssh_identity_create', 'ssh_principal_create', 'ssh_principal_grant', 'ssh_principal_map',
@@ -1387,6 +1446,8 @@ def run_module():
             'unspecified', 'keyCompromise', 'caCompromise', 'affiliationChanged',
             'superseded', 'cessationOfOperation', 'certificateHold', 'removeFromCRL',
         ]),
+        revocation_details=dict(type='str'),
+        cert_pem=dict(type='str'),
         # Download
         download_format=dict(type='str', default='pem', choices=[
             'pem', 'der', 'chain-pem', 'full-pem', 'full-der', 'key-pem', 'key-der',
@@ -1453,6 +1514,7 @@ def run_module():
             ('action', 'cert_revoke', ['cert_id']),
             ('action', 'cert_delete', ['cert_id']),
             ('action', 'cert_download', ['cert_id']),
+            ('action', 'cert_find', ['cert_pem']),
             ('action', 'search', ['search_query']),
             # SSH workflow
             ('action', 'ssh_ca_create', ['ssh_ca_type']),
@@ -1551,6 +1613,7 @@ def run_module():
             result = client.ca_revoke(
                 ca_id=module.params['ca_id'],
                 reason=module.params['revocation_reason'],
+                details=module.params.get('revocation_details'),
             )
 
     elif action == 'ca_delete':
@@ -1586,6 +1649,9 @@ def run_module():
             cert_type=module.params.get('cert_type'),
         )
 
+    elif action == 'cert_find':
+        result = client.cert_find(module.params['cert_pem'])
+
     elif action == 'cert_get':
         result = client.cert_get(cert_id=module.params['cert_id'])
 
@@ -1605,6 +1671,7 @@ def run_module():
             result = client.cert_revoke(
                 cert_id=module.params['cert_id'],
                 reason=module.params['revocation_reason'],
+                details=module.params.get('revocation_details'),
             )
 
     elif action == 'cert_delete':
@@ -1620,9 +1687,10 @@ def run_module():
             if not module.params.get('download_password'):
                 module.fail_json(msg=f"download_password is required for {fmt} format")
 
-        if module.check_mode:
-            result = {'changed': True, 'msg': 'Certificate would be downloaded (check mode)'}
+        if module.check_mode and not module.params.get('download_dest'):
+            result = {'changed': False, 'msg': 'Certificate would be downloaded (check mode)'}
         else:
+            # With download_dest, check mode compares the file and reports a change only when needed.
             result = client.cert_download(
                 cert_id=module.params['cert_id'],
                 format=fmt,
