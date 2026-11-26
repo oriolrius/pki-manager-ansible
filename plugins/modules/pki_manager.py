@@ -68,19 +68,27 @@ options:
     oidc_url:
         description:
             - OIDC token endpoint URL.
-        required: true
+            - Set it with O(client_id) and O(client_secret) for the OIDC client-credentials login.
+            - Omit all three for a server with OIDC disabled, for O(api_token), or for the fleet-token actions.
         type: str
     client_id:
         description:
             - OIDC client ID.
-        required: true
         type: str
     client_secret:
         description:
             - OIDC client secret.
-        required: true
         type: str
-        no_log: true
+    api_token:
+        description:
+            - A bearer token that you got before (for example from a CI step). The module then does not call O(oidc_url).
+            - It has priority over the OIDC credentials.
+        type: str
+    ca_path:
+        description:
+            - PEM file with the CA certificates to trust for HTTPS to the PKI Manager server and the OIDC server.
+            - Use it for a server with a private CA, instead of O(validate_certs=false).
+        type: path
     ca_id:
         description:
             - Certificate Authority ID (required for CA operations and cert_issue).
@@ -111,15 +119,19 @@ options:
         type: str
     ca_algorithm:
         description:
-            - Key algorithm for CA.
+            - Key algorithm for CA. The API accepts only RSA keys for a CA.
         type: str
-        choices: ['RSA-2048', 'RSA-4096', 'ECDSA-P256', 'ECDSA-P384']
+        choices: ['RSA-2048', 'RSA-4096']
         default: 'RSA-4096'
+    ca_validity_years:
+        description:
+            - CA validity in years (1-30). The server default is 20.
+        type: int
     ca_validity:
         description:
-            - CA validity in days.
+            - Deprecated. CA validity in days; the module rounds it to years (the API takes years only).
+            - Use O(ca_validity_years). Before 3.0.0 the server ignored this value and used 20 years.
         type: int
-        default: 3650
     cert_id:
         description:
             - Certificate ID (required for cert operations except cert_issue).
@@ -130,11 +142,11 @@ options:
         type: str
     cert_org:
         description:
-            - Certificate Organization.
+            - Certificate Organization (required for cert_issue; the API requires it).
         type: str
     cert_country:
         description:
-            - Certificate Country code (2 letters).
+            - Certificate Country code, 2 letters (required for cert_issue; the API requires it).
         type: str
     cert_ou:
         description:
@@ -150,10 +162,15 @@ options:
         type: str
     cert_type:
         description:
-            - Certificate type.
+            - Certificate type. For cert_issue the default is V(server).
+            - For cert_list it is a filter; omit it to list every type.
         type: str
         choices: ['server', 'client', 'dual', 'email', 'code_signing']
-        default: 'server'
+    cert_status:
+        description:
+            - Filter for cert_list.
+        type: str
+        choices: ['active', 'revoked', 'expired']
     cert_algorithm:
         description:
             - Key algorithm for certificate.
@@ -193,8 +210,6 @@ options:
             - cessationOfOperation
             - certificateHold
             - removeFromCRL
-            - privilegeWithdrawn
-            - aaCompromise
         default: 'unspecified'
     download_format:
         description:
@@ -220,8 +235,8 @@ options:
     download_password:
         description:
             - Password for encrypted formats (p12, pfx, jks-*, pkcs8-encrypted).
+            - The module sends it in the C(X-Export-Password) header, never in the URL.
         type: str
-        no_log: true
     download_dest:
         description:
             - Destination path for downloaded certificate.
@@ -252,9 +267,12 @@ options:
         default: 30
     token_cache_path:
         description:
-            - Path to cache OIDC tokens.
+            - File for the OIDC token cache.
+            - The default is a file in C(~/.cache/pki-manager-ansible/) (mode 0700) with a name made from
+              O(api_url), O(oidc_url) and O(client_id), so two servers or two clients never share a token.
+            - The module uses a cache file only when the current user owns it, nobody else can read it,
+              and it was written for the same server and client.
         type: path
-        default: '/tmp/.pki_token_cache'
     fleet_token:
         description:
             - Fleet bearer token (pkimg_...) for the host-facing external SSH API
@@ -329,8 +347,19 @@ options:
         type: list
         elements: str
     user_valid_seconds:
-        description: Validity in seconds for the user cert / signed host cert.
+        description:
+            - Validity in seconds for the user cert (ssh_user_issue).
+            - For ssh_sign_host it is used only when O(host_valid_seconds) is not set (old behaviour).
         type: int
+    host_valid_seconds:
+        description: Validity in seconds for the signed host cert (ssh_sign_host).
+        type: int
+    host_key_id:
+        description: Optional certificate key id for ssh_sign_host.
+        type: str
+    identity_external_subject:
+        description: Optional external (IdP) subject for ssh_identity_create.
+        type: str
     enforce_entitlement:
         description: Constrain issued principals to the identity's catalog entitlements (ssh_user_issue).
         type: bool
@@ -376,7 +405,7 @@ EXAMPLES = r'''
     ca_cn: "My Root CA"
     ca_org: "My Organization"
     ca_country: "US"
-    ca_validity: 3650
+    ca_validity_years: 10
   register: ca_result
 
 - name: Issue a certificate
@@ -483,7 +512,8 @@ import json
 import os
 import time
 import base64
-import ssl
+import hashlib
+import tempfile
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.urls import open_url
 
@@ -493,12 +523,20 @@ except ImportError:
     from urllib import urlencode, quote
 
 
+def default_token_cache_path(api_url, oidc_url, client_id):
+    """Per-user cache file whose name is bound to the server and the client."""
+    key = '|'.join([api_url or '', oidc_url or '', client_id or ''])
+    digest = hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]
+    base = os.path.join(os.path.expanduser('~'), '.cache', 'pki-manager-ansible')
+    return os.path.join(base, 'token-%s.json' % digest)
+
+
 class PKIManagerClient:
     """Client for PKI Manager API operations."""
 
     def __init__(self, module, api_url, oidc_url, client_id, client_secret,
-                 validate_certs=True, timeout=30, token_cache_path='/tmp/.pki_token_cache',
-                 fleet_token=None):
+                 validate_certs=True, timeout=30, token_cache_path=None,
+                 fleet_token=None, api_token=None, ca_path=None):
         self.module = module
         self.api_url = api_url.rstrip('/')
         self.oidc_url = oidc_url
@@ -506,43 +544,51 @@ class PKIManagerClient:
         self.client_secret = client_secret
         self.validate_certs = validate_certs
         self.timeout = timeout
-        self.token_cache_path = token_cache_path
+        self.ca_path = ca_path
+        self.token_cache_path = token_cache_path or default_token_cache_path(
+            self.api_url, oidc_url, client_id)
         # Fleet bearer token (pkimg_…) for the host-facing external SSH API.
         self.fleet_token = fleet_token
+        self.api_token = api_token
         self.access_token = None
+        self.token_from_cache = False
 
-    def authenticate(self):
-        """Authenticate with OIDC and get access token.
+    def _open(self, url, **kwargs):
+        kwargs.setdefault('timeout', self.timeout)
+        kwargs.setdefault('validate_certs', self.validate_certs)
+        if self.ca_path:
+            kwargs.setdefault('ca_path', self.ca_path)
+        return open_url(url, **kwargs)
 
-        OIDC is OPTIONAL: when no client credentials are supplied the client
-        makes unauthenticated requests. That covers a backend running with OIDC
-        disabled (ALLOW_UNAUTHENTICATED_SSH_CA=true), and the SSH host-facing
-        actions which authenticate with a fleet_token instead of OIDC.
+    def has_credentials(self):
+        return bool(self.api_token or (self.oidc_url and self.client_id and self.client_secret))
+
+    def authenticate(self, use_cache=True):
+        """Get the bearer token for the management API.
+
+        Authentication is OPTIONAL: with no api_token and no client credentials
+        the client makes unauthenticated requests. That covers a backend running
+        with OIDC disabled, and the SSH host-facing actions which authenticate
+        with a fleet_token instead.
         """
+        if self.api_token:
+            self.access_token = self.api_token
+            return True
         if not (self.oidc_url and self.client_id and self.client_secret):
             return False
-        # Try to use cached token
-        if self._load_cached_token():
+        if use_cache and self._load_cached_token():
+            self.token_from_cache = True
             return True
+        self.token_from_cache = False
 
-        # Request new token
         data = urlencode({
             'grant_type': 'client_credentials',
             'client_id': self.client_id,
             'client_secret': self.client_secret,
         })
-
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-
         try:
-            response = open_url(
-                self.oidc_url,
-                data=data,
-                headers=headers,
-                method='POST',
-                timeout=self.timeout,
-                validate_certs=self.validate_certs,
-            )
+            response = self._open(self.oidc_url, data=data, headers=headers, method='POST')
             token_data = json.loads(response.read())
             self.access_token = token_data['access_token']
             expires_in = token_data.get('expires_in', 300)
@@ -551,34 +597,63 @@ class PKIManagerClient:
         except Exception as e:
             self.module.fail_json(msg=f"OIDC authentication failed: {e}")
 
+    def _cache_identity(self):
+        return {'api_url': self.api_url, 'oidc_url': self.oidc_url, 'client_id': self.client_id}
+
     def _load_cached_token(self):
-        """Load token from cache if valid."""
+        """Load the token from the cache when the file is safe and for this server/client."""
+        path = self.token_cache_path
         try:
-            if os.path.exists(self.token_cache_path):
-                with open(self.token_cache_path, 'r') as f:
-                    cache = json.load(f)
-                if cache.get('expires_at', 0) > time.time() + 60:  # 60s buffer
-                    self.access_token = cache['access_token']
-                    return True
-        except (IOError, json.JSONDecodeError):
-            pass
+            st = os.lstat(path)
+        except OSError:
+            return False
+        # Never use a file another user could have written or can read.
+        if (not os.path.isfile(path) or os.path.islink(path)
+                or st.st_uid != os.geteuid() or st.st_mode & 0o077):
+            return False
+        try:
+            with open(path, 'r') as f:
+                cache = json.load(f)
+        except (IOError, OSError, ValueError):
+            return False
+        if cache.get('identity') != self._cache_identity():
+            return False
+        if cache.get('expires_at', 0) > time.time() + 60:  # 60s buffer
+            self.access_token = cache['access_token']
+            return True
         return False
 
     def _cache_token(self, expires_in):
-        """Cache token to file."""
+        """Write the cache atomically, mode 0600, in a 0700 directory."""
+        path = self.token_cache_path
         try:
-            cache = {
-                'access_token': self.access_token,
-                'expires_at': time.time() + expires_in,
-            }
-            with open(self.token_cache_path, 'w') as f:
-                os.chmod(self.token_cache_path, 0o600)
-                json.dump(cache, f)
-        except IOError:
+            directory = os.path.dirname(path) or '.'
+            if not os.path.isdir(directory):
+                os.makedirs(directory, 0o700)
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix='.token-')  # mode 0600
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump({
+                        'identity': self._cache_identity(),
+                        'access_token': self.access_token,
+                        'expires_at': time.time() + expires_in,
+                    }, f)
+                os.replace(tmp, path)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+        except (IOError, OSError):
             pass  # Caching is optional
 
-    def _request(self, method, endpoint, data=None, params=None):
-        """Make authenticated API request."""
+    def _clear_cached_token(self):
+        try:
+            os.unlink(self.token_cache_path)
+        except OSError:
+            pass
+
+    def _request(self, method, endpoint, data=None, params=None, extra_headers=None, _retried=False):
+        """Make an authenticated API request."""
         url = f"{self.api_url}{endpoint}"
         if params:
             url = f"{url}?{urlencode(params)}"
@@ -586,6 +661,8 @@ class PKIManagerClient:
         headers = {}
         if self.access_token:
             headers['Authorization'] = f"Bearer {self.access_token}"
+        if extra_headers:
+            headers.update(extra_headers)
 
         body = None
         if data is not None:
@@ -593,25 +670,42 @@ class PKIManagerClient:
             body = json.dumps(data)
 
         try:
-            response = open_url(
-                url,
-                data=body,
-                headers=headers,
-                method=method,
-                timeout=self.timeout,
-                validate_certs=self.validate_certs,
-            )
+            response = self._open(url, data=body, headers=headers, method=method)
             status = response.getcode()
-
-            # Parse response
             try:
                 response_data = json.loads(response.read())
                 return {'status': status, 'data': response_data, 'error': None}
             except (json.JSONDecodeError, ValueError):
                 return {'status': status, 'data': None, 'error': None}
-
         except Exception as e:
-            return self._err(e)
+            err = self._err(e)
+            # A cached token the server refuses (revoked, server key rotated):
+            # drop the cache, log in again and retry once.
+            if err['status'] == 401 and self.token_from_cache and not _retried:
+                self._clear_cached_token()
+                self.authenticate(use_cache=False)
+                return self._request(method, endpoint, data, params, extra_headers, _retried=True)
+            return err
+
+    @staticmethod
+    def _error_message(error_data, default):
+        """Read the message from both error shapes of the API.
+
+        Application errors: {"error": {"code": ..., "message": ...}}.
+        Fastify validation errors: {"error": "Bad Request", "message": ...}.
+        """
+        if not isinstance(error_data, dict):
+            return default
+        err = error_data.get('error')
+        if isinstance(err, dict):
+            msg = err.get('message') or default
+            code = err.get('code')
+            return f"{code}: {msg}" if code and code not in msg else msg
+        if error_data.get('message'):
+            return error_data['message']
+        if isinstance(err, str) and err:
+            return err
+        return default
 
     def _err(self, e):
         """Normalize an open_url exception into {status, data, error}."""
@@ -628,9 +722,8 @@ class PKIManagerClient:
         body = None
         if hasattr(e, 'read'):
             try:
-                error_data = json.loads(e.read())
-                body = error_data
-                error_msg = error_data.get('error', {}).get('message', error_str)
+                body = json.loads(e.read())
+                error_msg = self._error_message(body, error_str)
             except Exception:
                 pass
         if status == 404 and error_msg == error_str:
@@ -639,8 +732,25 @@ class PKIManagerClient:
             error_msg = 'Conflict - operation blocked'
         return {'status': status, 'data': None, 'error': error_msg, 'body': body}
 
-    def get(self, endpoint, params=None):
-        return self._request('GET', endpoint, params=params)
+    def get(self, endpoint, params=None, extra_headers=None):
+        return self._request('GET', endpoint, params=params, extra_headers=extra_headers)
+
+    def get_all(self, endpoint, params=None, page_size=100):
+        """GET every page of a {items, pagination} list endpoint."""
+        params = dict(params or {})
+        items, offset = [], 0
+        while True:
+            params.update({'limit': page_size, 'offset': offset})
+            r = self.get(endpoint, params=params)
+            if r['error']:
+                return r, items, 0
+            data = r['data'] or {}
+            page = data.get('items', [])
+            items.extend(page)
+            total = (data.get('pagination') or {}).get('total', len(items))
+            offset += len(page)
+            if not page or offset >= total:
+                return r, items, total
 
     def post(self, endpoint, data=None):
         return self._request('POST', endpoint, data=data)
@@ -650,11 +760,17 @@ class PKIManagerClient:
 
     # Action implementations
     def auth_test(self):
-        """Test authentication."""
-        result = self.get('/health')
+        """Test authentication against an endpoint that needs it (/health does not)."""
+        health = self.get('/health')
+        result = self.get('/dashboard/stats')
         if result['error']:
-            return {'changed': False, 'msg': f"Authentication failed: {result['error']}"}
-        return {'changed': False, 'msg': 'Authentication successful', 'status': result['data']}
+            return {'changed': False, 'failed': True,
+                    'msg': f"Authentication failed: {result['error']}"}
+        msg = 'Authentication successful'
+        if not self.has_credentials():
+            msg = 'No credentials configured; the server accepts anonymous requests (OIDC disabled)'
+        return {'changed': False, 'msg': msg, 'authenticated': self.has_credentials(),
+                'status': health['data']}
 
     def stats(self):
         """Get PKI statistics."""
@@ -685,7 +801,7 @@ class PKIManagerClient:
         }
 
     def ca_create(self, cn, org, country, ou=None, state=None, locality=None,
-                  algorithm='RSA-4096', validity=3650):
+                  algorithm='RSA-4096', validity_years=None):
         """Create a Certificate Authority."""
         payload = {
             'subject': {
@@ -694,8 +810,9 @@ class PKIManagerClient:
                 'country': country,
             },
             'keyAlgorithm': algorithm,
-            'validityDays': validity,
         }
+        if validity_years:
+            payload['validityYears'] = validity_years
         if ou:
             payload['subject']['organizationalUnit'] = ou
         if state:
@@ -715,11 +832,9 @@ class PKIManagerClient:
 
     def ca_list(self):
         """List Certificate Authorities."""
-        result = self.get('/cas/')
+        result, items, total = self.get_all('/cas/')
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
-        items = result['data'].get('items', [])
-        total = result['data'].get('pagination', {}).get('total', len(items))
         return {
             'changed': False,
             'cas': items,
@@ -755,13 +870,13 @@ class PKIManagerClient:
         return {'changed': True, 'msg': f"CA {ca_id} deleted"}
 
     def cert_issue(self, ca_id, cn, org=None, country=None, ou=None, state=None,
-                   locality=None, cert_type='server', algorithm='RSA-2048',
+                   locality=None, cert_type=None, algorithm='RSA-2048',
                    validity=365, dns_names=None, ip_addresses=None, emails=None):
         """Issue a certificate."""
         payload = {
             'caId': ca_id,
             'subject': {'commonName': cn},
-            'certificateType': cert_type,
+            'certificateType': cert_type or 'server',
             'keyAlgorithm': algorithm,
             'validityDays': validity,
         }
@@ -802,11 +917,9 @@ class PKIManagerClient:
         if cert_type:
             params['type'] = cert_type
 
-        result = self.get('/certificates/', params=params if params else None)
+        result, items, total = self.get_all('/certificates/', params=params)
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
-        items = result['data'].get('items', [])
-        total = result['data'].get('pagination', {}).get('total', len(items))
         return {
             'changed': False,
             'certificates': items,
@@ -847,8 +960,9 @@ class PKIManagerClient:
         result = self.delete(f'/certificates/{cert_id}')
         if result['status'] == 404:
             return {'changed': False, 'msg': f"Certificate {cert_id} not found (already deleted?)"}
-        if result['status'] in [409, 500]:
-            return {'changed': False, 'msg': f"Certificate {cert_id} cannot be deleted yet"}
+        if result['status'] == 409:
+            return {'changed': False,
+                    'msg': f"Certificate {cert_id} cannot be deleted yet: {result['error']}"}
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
         return {'changed': True, 'msg': f"Certificate {cert_id} deleted"}
@@ -856,10 +970,12 @@ class PKIManagerClient:
     def cert_download(self, cert_id, format='pem', password=None, dest=None):
         """Download a certificate."""
         params = {'format': format}
+        headers = None
         if password and format in ['p12', 'pfx', 'jks-keystore', 'jks-truststore', 'pkcs8-encrypted']:
-            params['password'] = password
+            # A header, never the query string: URLs end up in server and proxy logs.
+            headers = {'X-Export-Password': password}
 
-        result = self.get(f'/certificates/{cert_id}/download', params=params)
+        result = self.get(f'/certificates/{cert_id}/download', params=params, extra_headers=headers)
         if result['error']:
             return {'changed': False, 'failed': True, 'msg': result['error']}
 
@@ -910,8 +1026,7 @@ class PKIManagerClient:
         if self.access_token:
             headers['Authorization'] = f"Bearer {self.access_token}"
         try:
-            resp = open_url(url, headers=headers, method='GET',
-                            timeout=self.timeout, validate_certs=self.validate_certs)
+            resp = self._open(url, headers=headers, method='GET')
             return {'status': resp.getcode(), 'text': resp.read().decode('utf-8'), 'error': None}
         except Exception as e:
             err = self._err(e)
@@ -930,8 +1045,7 @@ class PKIManagerClient:
             headers['Content-Type'] = 'application/json'
             body = json.dumps(data)
         try:
-            resp = open_url(url, data=body, headers=headers, method=method,
-                            timeout=self.timeout, validate_certs=self.validate_certs)
+            resp = self._open(url, data=body, headers=headers, method=method)
             try:
                 return {'status': resp.getcode(), 'data': json.loads(resp.read()), 'error': None}
             except (json.JSONDecodeError, ValueError):
@@ -1161,6 +1275,8 @@ def run_module():
         oidc_url=dict(type='str'),
         client_id=dict(type='str'),
         client_secret=dict(type='str', no_log=True),
+        api_token=dict(type='str', no_log=True),
+        ca_path=dict(type='path'),
         # CA options
         ca_id=dict(type='str'),
         ca_cn=dict(type='str'),
@@ -1169,8 +1285,9 @@ def run_module():
         ca_ou=dict(type='str'),
         ca_state=dict(type='str'),
         ca_locality=dict(type='str'),
-        ca_algorithm=dict(type='str', default='RSA-4096', choices=['RSA-2048', 'RSA-4096', 'ECDSA-P256', 'ECDSA-P384']),
-        ca_validity=dict(type='int', default=3650),
+        ca_algorithm=dict(type='str', default='RSA-4096', choices=['RSA-2048', 'RSA-4096']),
+        ca_validity_years=dict(type='int'),
+        ca_validity=dict(type='int'),
         # Certificate options
         cert_id=dict(type='str'),
         cert_cn=dict(type='str'),
@@ -1179,7 +1296,8 @@ def run_module():
         cert_ou=dict(type='str'),
         cert_state=dict(type='str'),
         cert_locality=dict(type='str'),
-        cert_type=dict(type='str', default='server', choices=['server', 'client', 'dual', 'email', 'code_signing']),
+        cert_type=dict(type='str', choices=['server', 'client', 'dual', 'email', 'code_signing']),
+        cert_status=dict(type='str', choices=['active', 'revoked', 'expired']),
         cert_algorithm=dict(type='str', default='RSA-2048', choices=['RSA-2048', 'RSA-4096', 'ECDSA-P256', 'ECDSA-P384']),
         cert_validity=dict(type='int', default=365),
         cert_dns_names=dict(type='list', elements='str'),
@@ -1189,7 +1307,6 @@ def run_module():
         revocation_reason=dict(type='str', default='unspecified', choices=[
             'unspecified', 'keyCompromise', 'caCompromise', 'affiliationChanged',
             'superseded', 'cessationOfOperation', 'certificateHold', 'removeFromCRL',
-            'privilegeWithdrawn', 'aaCompromise',
         ]),
         # Download
         download_format=dict(type='str', default='pem', choices=[
@@ -1225,6 +1342,9 @@ def run_module():
         ssh_public_key=dict(type='str'),
         principals=dict(type='list', elements='str'),
         user_valid_seconds=dict(type='int'),
+        host_valid_seconds=dict(type='int'),
+        host_key_id=dict(type='str'),
+        identity_external_subject=dict(type='str'),
         enforce_entitlement=dict(type='bool'),
         cert_authority_pattern=dict(type='str', default='*'),
         block_reason=dict(type='str'),
@@ -1233,18 +1353,19 @@ def run_module():
         # Connection
         validate_certs=dict(type='bool', default=True),
         timeout=dict(type='int', default=30),
-        token_cache_path=dict(type='path', default='/tmp/.pki_token_cache'),
+        token_cache_path=dict(type='path', no_log=False),
     )
 
     module = AnsibleModule(
         argument_spec=module_args,
         supports_check_mode=True,
+        mutually_exclusive=[('ca_validity_years', 'ca_validity')],
         required_if=[
             ('action', 'ca_create', ['ca_cn', 'ca_org', 'ca_country']),
             ('action', 'ca_get', ['ca_id']),
             ('action', 'ca_revoke', ['ca_id']),
             ('action', 'ca_delete', ['ca_id']),
-            ('action', 'cert_issue', ['ca_id', 'cert_cn']),
+            ('action', 'cert_issue', ['ca_id', 'cert_cn', 'cert_org', 'cert_country']),
             ('action', 'cert_get', ['cert_id']),
             ('action', 'cert_renew', ['cert_id']),
             ('action', 'cert_revoke', ['cert_id']),
@@ -1284,6 +1405,8 @@ def run_module():
         timeout=module.params['timeout'],
         token_cache_path=module.params['token_cache_path'],
         fleet_token=module.params.get('fleet_token'),
+        api_token=module.params.get('api_token'),
+        ca_path=module.params.get('ca_path'),
     )
 
     # Authenticate (OIDC; no-op when no client credentials are supplied)
@@ -1308,6 +1431,16 @@ def run_module():
         )
 
     elif action == 'ca_create':
+        validity_years = module.params['ca_validity_years']
+        if module.params['ca_validity'] is not None:
+            # The API takes years; the old option was days and the server ignored it.
+            validity_years = max(1, min(30, int(round(module.params['ca_validity'] / 365.0))))
+            module.deprecate(
+                'ca_validity (days) is deprecated; use ca_validity_years. '
+                f"Sending validityYears={validity_years}.",
+                version='4.0.0', collection_name='oriolrius.pki_manager')
+        if validity_years is not None and not 1 <= validity_years <= 30:
+            module.fail_json(msg='ca_validity_years must be between 1 and 30')
         if module.check_mode:
             result = {'changed': True, 'msg': 'CA would be created (check mode)'}
         else:
@@ -1319,7 +1452,7 @@ def run_module():
                 state=module.params['ca_state'],
                 locality=module.params['ca_locality'],
                 algorithm=module.params['ca_algorithm'],
-                validity=module.params['ca_validity'],
+                validity_years=validity_years,
             )
 
     elif action == 'ca_list':
@@ -1366,7 +1499,8 @@ def run_module():
     elif action == 'cert_list':
         result = client.cert_list(
             ca_id=module.params.get('ca_id'),
-            cert_type=module.params.get('cert_type') if module.params.get('cert_type') != 'server' else None,
+            status=module.params.get('cert_status'),
+            cert_type=module.params.get('cert_type'),
         )
 
     elif action == 'cert_get':
@@ -1438,7 +1572,11 @@ def run_module():
         if module.check_mode:
             result = {'changed': True, 'msg': 'SSH identity would be created (check mode)'}
         else:
-            result = client.ssh_identity_create(module.params['identity_subject'], module.params.get('identity_email'))
+            result = client.ssh_identity_create(
+                module.params['identity_subject'],
+                module.params.get('identity_email'),
+                module.params.get('identity_external_subject'),
+            )
 
     elif action == 'ssh_principal_create':
         if module.check_mode:
@@ -1516,7 +1654,9 @@ def run_module():
                 ssh_public_key=module.params['host_pubkey'],
                 addresses=module.params.get('host_addresses'),
                 idempotency_key=module.params.get('idempotency_key'),
-                valid_for_seconds=module.params.get('user_valid_seconds'),
+                valid_for_seconds=(module.params.get('host_valid_seconds')
+                                   or module.params.get('user_valid_seconds')),
+                key_id=module.params.get('host_key_id'),
             )
 
     elif action == 'ssh_register_host_pubkey':

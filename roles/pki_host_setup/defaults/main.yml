@@ -4,7 +4,14 @@ pki_api_url: ""
 pki_oidc_url: ""
 pki_client_id: ""
 pki_client_secret: ""
+# A bearer token you got before (instead of the OIDC client credentials).
+pki_api_token: ""
 pki_validate_certs: true
+# PEM bundle on the CONTROLLER to trust a PKI Manager server with a private CA.
+pki_ca_path: ""
+
+# The role calls the PKI Manager API from the controller (delegate_to: localhost):
+# the OIDC client secret and the tokens never go to the managed hosts.
 
 # CA to use for issuing certificates
 pki_ca_id: ""
@@ -33,7 +40,8 @@ pki_cert_locality: ""  # Locality/City (optional)
 #   - name: identifier for the certificate (default: ansible_hostname)
 #   - cn: Common Name (default: ansible_fqdn or ansible_hostname)
 #   - type: server, client, dual, email, code_signing (default: server)
-#   - dns_names: list of DNS SANs (default: [ansible_fqdn, ansible_hostname])
+#   - dns_names: list of DNS SANs (default: ansible_fqdn and ansible_hostname,
+#                only the names with two or more labels; the API rejects "host")
 #   - ip_addresses: list of IP SANs (default: [ansible_default_ipv4.address])
 #   - validity: days (default: pki_cert_validity)
 #   - format: pem, p12, pfx (default: pem)
@@ -66,3 +74,15 @@ pki_certificates: []
 #       - "lb.example.com"
 #     notify:
 #       - reload haproxy
+
+# --- Idempotency -------------------------------------------------------------
+# The role keeps one state file per certificate on the host (cert id, request
+# hash, notAfter). A run issues a new certificate only when there is no state,
+# the request changed (CN, SANs, type, subject, algorithm, CA, format), a file
+# is missing, or the certificate expires within pki_cert_renew_before_days.
+# Set force: true on one entry (or pki_cert_force) to issue again anyway.
+pki_state_dir: "/etc/pki-manager/certs"
+pki_cert_renew_before_days: 30
+pki_cert_force: false
+# Revoke (reason "superseded") the certificate that a new one replaces.
+pki_revoke_replaced: true

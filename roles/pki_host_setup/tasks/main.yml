@@ -1,5 +1,9 @@
 ---
-# PKI Host Setup - Main tasks
+# Main tasks for pki_host_setup role
+#
+# Every PKI Manager API call runs on the controller (delegate_to: localhost,
+# become: false). The managed host only receives the certificate files; the
+# OIDC client secret and the bearer tokens never leave the controller.
 
 - name: Validate supported OS
   ansible.builtin.assert:
@@ -13,13 +17,15 @@
   ansible.builtin.assert:
     that:
       - pki_api_url | length > 0
-      - pki_oidc_url | length > 0
-      - pki_client_id | length > 0
-      - pki_client_secret | length > 0
+      - >-
+        (pki_api_token | length > 0) or
+        ((pki_oidc_url | length > 0) and (pki_client_id | length > 0) and (pki_client_secret | length > 0))
       - pki_ca_id | length > 0
       - pki_cert_org | length > 0
       - pki_cert_country | length == 2
-    fail_msg: "Missing required PKI configuration variables (api_url, oidc_url, client_id, client_secret, ca_id, cert_org, cert_country)"
+    fail_msg: >-
+      Missing PKI configuration: pki_api_url, pki_ca_id, pki_cert_org, pki_cert_country (2 letters),
+      and either pki_api_token or pki_oidc_url + pki_client_id + pki_client_secret.
 
 - name: Ensure ssl-cert group exists
   ansible.builtin.group:
@@ -38,17 +44,23 @@
     - { path: "{{ pki_cert_dir }}", group: "root", mode: "0755" }
     - { path: "{{ pki_key_dir }}", group: "ssl-cert", mode: "0710" }
     - { path: "{{ pki_ca_trust_dir }}", group: "root", mode: "0755" }
+    - { path: "{{ pki_state_dir }}", group: "root", mode: "0755" }
 
 - name: Get CA certificate
   oriolrius.pki_manager.pki_manager:
     action: ca_get
     api_url: "{{ pki_api_url }}"
-    oidc_url: "{{ pki_oidc_url }}"
-    client_id: "{{ pki_client_id }}"
-    client_secret: "{{ pki_client_secret }}"
+    oidc_url: "{{ pki_oidc_url | default(omit, true) }}"
+    client_id: "{{ pki_client_id | default(omit, true) }}"
+    client_secret: "{{ pki_client_secret | default(omit, true) }}"
+    api_token: "{{ pki_api_token | default(omit, true) }}"
+    ca_path: "{{ pki_ca_path | default(omit, true) }}"
     validate_certs: "{{ pki_validate_certs }}"
     ca_id: "{{ pki_ca_id }}"
   register: _pki_ca_info
+  delegate_to: localhost
+  become: false
+  check_mode: false  # read-only
 
 - name: Install CA certificate in trust store
   when: pki_install_ca_trust

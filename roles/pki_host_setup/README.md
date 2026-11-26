@@ -15,12 +15,28 @@ Ansible role to setup Ubuntu hosts with certificates from PKI Manager.
 - Install CA certificate in system trust store
 - PEM and PKCS12 format support
 - Proper file permissions (ssl-cert group for keys)
-- Handler notifications for service restarts
+- Handler notifications for service restarts (only when a certificate changes)
+- Idempotent: a run issues a new certificate only when it is needed (see below)
+- All API calls run on the controller: no secret or token goes to the managed hosts
 
 ## Requirements
 
-- PKI Manager API access with OIDC credentials
+- PKI Manager API access from the controller, with OIDC client credentials or a bearer token (`pki_api_token`)
 - An existing CA in PKI Manager
+
+## Idempotency
+
+The role keeps a state file per certificate in `pki_state_dir` (default `/etc/pki-manager/certs/<name>.json`):
+the certificate id, a hash of the request, and `notAfter`. A run issues a new certificate only when:
+
+- there is no state file (first run), or
+- the request changed (CA, CN, SANs, type, subject fields, algorithm, format), or
+- a certificate, key, chain or PKCS#12 file is missing, or
+- the certificate expires within `pki_cert_renew_before_days` (default 30), or
+- `force: true` is set on the entry (or `pki_cert_force: true`).
+
+Otherwise the role changes nothing and does not notify the handlers. When it issues a new certificate,
+it revokes the one it replaces with reason `superseded` (set `pki_revoke_replaced: false` to keep it).
 
 ## Role Variables
 
@@ -60,7 +76,7 @@ pki_certificates:
   - name: "webserver"              # Identifier (default: hostname)
     cn: "server.example.com"       # Common Name (default: FQDN)
     type: "server"                 # server, client, dual, email, code_signing
-    dns_names:                     # DNS SANs (default: [FQDN, hostname])
+    dns_names:                     # DNS SANs (default: FQDN and hostname, only names with a dot)
       - "server.example.com"
       - "www.example.com"
     ip_addresses:                  # IP SANs (default: [default_ipv4])

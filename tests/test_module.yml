@@ -74,7 +74,7 @@
         ca_cn: "{{ test_ca_cn }}"
         ca_org: "{{ test_ca_org }}"
         ca_country: "{{ test_ca_country }}"
-        ca_validity: 365
+        ca_validity_years: 1
       register: ca_create_result
 
     - name: Display created CA
