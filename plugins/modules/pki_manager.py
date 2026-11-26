@@ -63,6 +63,41 @@ options:
             - ssh_principals_pushed
             - ssh_zone_list
             - ssh_zone_create
+            - ca_certs
+            - ca_download
+            - crl_list
+            - crl_generate
+            - crl_download
+            - cert_bulk_renew
+            - cert_bulk_revoke
+            - cert_bulk_delete
+            - domain_list
+            - audit_list
+            - report_generate
+            - ssh_ca_get
+            - ssh_ca_rotate
+            - ssh_ca_retire
+            - ssh_ca_revoke
+            - ssh_krl_generate
+            - ssh_host_get
+            - ssh_host_issue
+            - ssh_host_revoke
+            - ssh_host_offboard
+            - ssh_identity_disable
+            - ssh_identity_offboard
+            - ssh_principal_revoke_grant
+            - ssh_principal_unmap
+            - ssh_principal_delete
+            - ssh_token_revoke
+            - ssh_cert_revoke
+            - ssh_metrics
+            - ssh_trust_anchors
+            - ssh_bulk_expiring
+            - ssh_bulk_renew
+            - ssh_bulk_revoke
+            - ssh_zone_archive
+            - ssh_zone_unarchive
+            - api_request
     api_url:
         description:
             - PKI Manager API URL.
@@ -457,6 +492,103 @@ options:
     zone_display_name:
         description: Display name for ssh_zone_create.
         type: str
+    cert_ids:
+        description: Certificate ids for cert_bulk_renew, cert_bulk_revoke and cert_bulk_delete.
+        type: list
+        elements: str
+    ca_download_format:
+        description:
+            - Format for ca_download. The keystore formats hold the CA private key; the server refuses
+              them unless it runs with C(ALLOW_CA_KEY_EXPORT=true).
+        type: str
+        choices: [pem, crt, der, cer, p12-truststore, p12-keystore, jks-truststore, jks-keystore]
+        default: pem
+    crl_next_update_days:
+        description: Days until the new CRL expires (crl_generate, 1-365; server default 7).
+        type: int
+    crl_format:
+        description: crl_download format. V(crl) is PEM, V(der) is binary.
+        type: str
+        choices: [crl, der]
+        default: crl
+    audit_operation:
+        description: audit_list filter, for example V(ca.create).
+        type: str
+    audit_entity_type:
+        description: audit_list filter (ca, certificate, ...).
+        type: str
+    audit_entity_id:
+        description: audit_list filter.
+        type: str
+    audit_status:
+        description: audit_list filter.
+        type: str
+        choices: [success, failure]
+    audit_start:
+        description: audit_list start date (Unix timestamp or ISO-8601).
+        type: str
+    audit_end:
+        description: audit_list end date (Unix timestamp or ISO-8601).
+        type: str
+    audit_limit:
+        description: Maximum entries for audit_list (1-200).
+        type: int
+        default: 100
+    report_type:
+        description: Report for report_generate.
+        type: str
+        choices: [certificate_inventory, revocation, ca_operations]
+    report_start:
+        description: report_generate start (Unix timestamp).
+        type: int
+    report_end:
+        description: report_generate end (Unix timestamp).
+        type: int
+    ssh_ca_id:
+        description: SSH CA id (ssh_ca_get, ssh_ca_rotate, ssh_ca_retire, ssh_ca_revoke, ssh_krl_generate).
+        type: str
+    ssh_reason:
+        description: Reason for ssh_ca_revoke, ssh_host_revoke, ssh_host_offboard, ssh_identity_offboard, ssh_cert_revoke, ssh_bulk_revoke.
+        type: str
+    token_id:
+        description: Fleet token id for ssh_token_revoke.
+        type: str
+    ssh_cert_id:
+        description: SSH certificate id for ssh_cert_revoke.
+        type: str
+    ssh_cert_ids:
+        description: SSH certificate ids for ssh_bulk_renew and ssh_bulk_revoke.
+        type: list
+        elements: str
+    ssh_within_seconds:
+        description: ssh_bulk_expiring lists the SSH certificates that expire within this many seconds.
+        type: int
+        default: 2592000
+    api_method:
+        description: HTTP method for api_request.
+        type: str
+        choices: [GET, POST, PUT, PATCH, DELETE]
+        default: GET
+    api_path:
+        description:
+            - Path for api_request, for example C(/ssh/hosts/{id}/access). It is relative to O(api_url),
+              or to the server root with O(api_public=true) (C(/cas/<id>.pem), C(/krl/<id>.bin), ...).
+        type: str
+    api_body:
+        description: JSON body for api_request (a dict, a list, or a JSON string).
+        type: raw
+    api_query:
+        description: Query parameters for api_request.
+        type: dict
+    api_public:
+        description: api_request calls the server root (the public, unauthenticated routes), not O(api_url).
+        type: bool
+        default: false
+    api_changed:
+        description:
+            - The C(changed) value that api_request reports. The default is V(false) for GET and V(true) for the other methods.
+            - Check mode does not send a request that is not a GET.
+        type: bool
     zone_description:
         description: Description for ssh_zone_create.
         type: str
@@ -1157,6 +1289,124 @@ class PKIManagerClient:
         return {'changed': False, 'failed': True, 'serial_number': serial,
                 'msg': f"No certificate with serial {serial} on the server"}
 
+    def write_dest(self, dest, content, filename, what):
+        """Write content to dest (0600, atomic). Same content and mode: no change."""
+        try:
+            if os.path.isfile(dest) and not os.path.islink(dest):
+                with open(dest, 'rb') as f:
+                    same = f.read() == content
+                if same and (os.stat(dest).st_mode & 0o777) == 0o600:
+                    return {'changed': False, 'downloaded_file': dest, 'filename': filename,
+                            'msg': f"{dest} is up to date"}
+            if self.module.check_mode:
+                return {'changed': True, 'downloaded_file': dest, 'filename': filename,
+                        'msg': f"{dest} would be written (check mode)"}
+            # A 0600 temp file in the same directory, then rename: the content is
+            # never in a file that others can read.
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dest)), prefix='.pki-')
+            try:
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(content)
+                os.replace(tmp, dest)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+            return {'changed': True, 'downloaded_file': dest, 'filename': filename,
+                    'msg': f"{what} downloaded to {dest}"}
+        except (IOError, OSError) as e:
+            return {'changed': False, 'failed': True, 'msg': f"Failed to write file: {e}"}
+
+    def ca_download(self, ca_id, format='pem', password=None, dest=None):
+        """Download a CA certificate, truststore or keystore."""
+        headers = {'X-Export-Password': password} if password else None
+        result = self.get(f'/cas/{ca_id}/download', params={'format': format}, extra_headers=headers)
+        if result['error']:
+            return {'changed': False, 'failed': True, 'msg': result['error']}
+        data = result['data'] or {}
+        content = base64.b64decode(data.get('data', ''))
+        filename = data.get('filename', f'{ca_id}.{format}')
+        if dest:
+            return self.write_dest(dest, content, filename, 'CA certificate')
+        return {'changed': False, 'content': base64.b64encode(content).decode('utf-8'),
+                'filename': filename, 'msg': f"CA {ca_id} downloaded as {format}"}
+
+    def crl_download(self, ca_id, crl_format='crl', dest=None):
+        """Download the current CRL of a CA from its public distribution point."""
+        r = self._get_public(f"/crl/{quote(ca_id, safe='')}.{crl_format}")
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        content = r['content']
+        ok = content.startswith(b'-----BEGIN X509 CRL-----') if crl_format == 'crl' else content[:1] == b'\x30'
+        if not ok:
+            return {'changed': False, 'failed': True,
+                    'msg': f"The server answered with something that is not a CRL ({len(content)} bytes)"}
+        filename = f"{ca_id}.{crl_format}"
+        if dest:
+            return self.write_dest(dest, content, filename, 'CRL')
+        if crl_format == 'crl':
+            return {'changed': False, 'crl': content.decode('ascii'), 'filename': filename, 'msg': 'Fetched CRL'}
+        return {'changed': False, 'content': base64.b64encode(content).decode('utf-8'),
+                'filename': filename, 'msg': 'Fetched CRL (DER, base64)'}
+
+    def report_generate(self, report_type, report_format='csv', ca_id=None, start=None, end=None, dest=None):
+        payload = {'reportType': report_type, 'format': report_format}
+        if ca_id:
+            payload['caId'] = ca_id
+        if start is not None:
+            payload['startDate'] = start
+        if end is not None:
+            payload['endDate'] = end
+        r = self.post('/reports', payload)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        data = r['data'] or {}
+        result = {'changed': False, 'report': data,
+                  'msg': f"Report {data.get('reportName', report_type)}: {data.get('recordCount', 0)} records"}
+        if dest:
+            written = self.write_dest(dest, (data.get('content') or '').encode('utf-8'),
+                                      data.get('reportName', report_type), 'Report')
+            if written.get('failed'):
+                return written
+            result.update({k: v for k, v in written.items() if k != 'msg'})
+        return result
+
+    def api_request(self, method, path, body=None, query=None, public=False, changed=None):
+        """Any API call, with the module's authentication, retry and errors."""
+        if not path or not path.startswith('/'):
+            return {'changed': False, 'failed': True, 'msg': 'api_path must start with /'}
+        method = method.upper()
+        is_change = method != 'GET' if changed is None else bool(changed)
+        if self.module.check_mode and method != 'GET':
+            return {'changed': is_change, 'msg': f"{method} {path} would be sent (check mode)"}
+        if public:
+            url_path = path + (f"?{urlencode(query)}" if query else '')
+            r = self._get_public(url_path) if method == 'GET' else {
+                'error': 'api_public supports GET only', 'status': 400}
+            if r.get('error'):
+                return {'changed': False, 'failed': True, 'status': r.get('status'), 'msg': r['error']}
+            content = r['content']
+            try:
+                return {'changed': is_change, 'status': r['status'], 'json': json.loads(content), 'msg': 'OK'}
+            except ValueError:
+                pass
+            try:
+                return {'changed': is_change, 'status': r['status'], 'text': content.decode('utf-8'), 'msg': 'OK'}
+            except UnicodeDecodeError:
+                return {'changed': is_change, 'status': r['status'],
+                        'content': base64.b64encode(content).decode('ascii'), 'msg': 'OK (binary, base64)'}
+        if isinstance(body, str):
+            try:
+                body = json.loads(body) if body.strip() else None
+            except ValueError as e:
+                return {'changed': False, 'failed': True, 'msg': f"api_body is not valid JSON: {e}"}
+        data = body if body is not None else ({} if method in ('POST', 'PUT', 'PATCH') else None)
+        r = self._request(method, path, data=data, params=query)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'status': r['status'], 'msg': r['error'],
+                    'json': r.get('body')}
+        return {'changed': is_change, 'status': r['status'], 'json': r['data'], 'msg': f"{method} {path}: {r['status']}"}
+
     def cert_download(self, cert_id, format='pem', password=None, dest=None):
         """Download a certificate."""
         params = {'format': format}
@@ -1174,35 +1424,7 @@ class PKIManagerClient:
         filename = data.get('filename', f'{cert_id}.{format}')
 
         if dest:
-            try:
-                if os.path.isfile(dest) and not os.path.islink(dest):
-                    with open(dest, 'rb') as f:
-                        same = f.read() == content
-                    if same and (os.stat(dest).st_mode & 0o777) == 0o600:
-                        return {'changed': False, 'downloaded_file': dest, 'filename': filename,
-                                'msg': f"{dest} is up to date"}
-                if self.module.check_mode:
-                    return {'changed': True, 'downloaded_file': dest, 'filename': filename,
-                            'msg': f"{dest} would be written (check mode)"}
-                # Write a 0600 temp file in the same directory, then rename: no
-                # moment with the content in a file that others can read.
-                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dest)), prefix='.pki-')
-                try:
-                    with os.fdopen(fd, 'wb') as f:
-                        f.write(content)
-                    os.replace(tmp, dest)
-                except BaseException:
-                    if os.path.exists(tmp):
-                        os.unlink(tmp)
-                    raise
-                return {
-                    'changed': True,
-                    'downloaded_file': dest,
-                    'filename': filename,
-                    'msg': f"Certificate downloaded to {dest}",
-                }
-            except IOError as e:
-                return {'changed': False, 'failed': True, 'msg': f"Failed to write file: {e}"}
+            return self.write_dest(dest, content, filename, 'Certificate')
 
         return {
             'changed': False,
@@ -1225,6 +1447,24 @@ class PKIManagerClient:
             if u.endswith(suffix):
                 return u[:-len(suffix)]
         return u
+
+    def _get_public(self, path):
+        """GET a root-level public resource as bytes."""
+        url = f"{self._origin()}{path}"
+        headers = {}
+        if self.access_token:
+            headers['Authorization'] = f"Bearer {self.access_token}"
+        try:
+            resp = self._open(url, headers=headers, method='GET')
+            content = resp.read()
+            ctype = (resp.headers.get('Content-Type') or '') if hasattr(resp, 'headers') else ''
+            if 'text/html' in ctype:
+                return {'status': resp.getcode(), 'content': b'', 'error':
+                        f"{path} returned an HTML page: a reverse proxy sends this path to the web UI"}
+            return {'status': resp.getcode(), 'content': content, 'error': None}
+        except Exception as e:
+            err = self._err(e)
+            return {'status': err['status'], 'content': None, 'error': err['error']}
 
     def _get_text(self, path):
         """GET a root-level text/plain resource (e.g. /ssh/cert-authority)."""
@@ -1531,6 +1771,110 @@ class PKIManagerClient:
                 'msg': f"Acknowledged principal push for {fqdn}"}
 
 
+# Named actions that map one-to-one to an API operation. path placeholders and
+# the body/query values come from module options: {api field: option name}.
+SIMPLE_ACTIONS = {
+    'ca_certs': dict(method='GET', path='/cas/{ca_id}/certificates', paged=True, key='certificates'),
+    'crl_list': dict(method='GET', path='/cas/{ca_id}/crls', paged=True, key='crls'),
+    'crl_generate': dict(method='POST', path='/cas/{ca_id}/crls', changed=True, key='crl',
+                         body={'nextUpdateDays': 'crl_next_update_days'}),
+    'cert_bulk_renew': dict(method='POST', path='/certificates/bulk/renew', changed=True, key='bulk', bulk=True,
+                            required=['cert_ids'],
+                            body={'certificateIds': 'cert_ids', 'generateNewKey': 'renew_new_key',
+                                  'validityDays': 'cert_validity', 'revokeOriginal': 'revoke_original'}),
+    'cert_bulk_revoke': dict(method='POST', path='/certificates/bulk/revoke', changed=True, key='bulk', bulk=True,
+                             required=['cert_ids'],
+                             body={'certificateIds': 'cert_ids', 'reason': 'revocation_reason',
+                                   'details': 'revocation_details', 'generateCrl': 'generate_crl'}),
+    'cert_bulk_delete': dict(method='DELETE', path='/certificates/bulk/', changed=True, key='bulk', bulk=True,
+                             required=['cert_ids'],
+                             body={'certificateIds': 'cert_ids', 'destroyKey': 'destroy_key',
+                                   'removeFromCrl': 'remove_from_crl'}),
+    'domain_list': dict(method='GET', path='/domains', paged=True, key='domains',
+                        query={'search': 'search_query', 'caId': 'ca_id'}),
+    'audit_list': dict(method='GET', path='/audit', key='audit',
+                       query={'operation': 'audit_operation', 'entityType': 'audit_entity_type',
+                              'entityId': 'audit_entity_id', 'status': 'audit_status',
+                              'startDate': 'audit_start', 'endDate': 'audit_end', 'limit': 'audit_limit'}),
+    'ssh_ca_get': dict(method='GET', path='/ssh/cas/{ssh_ca_id}', key='ssh_ca'),
+    'ssh_ca_rotate': dict(method='POST', path='/ssh/cas/{ssh_ca_id}/rotate', changed=True, key='ssh_ca'),
+    'ssh_ca_retire': dict(method='POST', path='/ssh/cas/{ssh_ca_id}/retire', changed=True, key='ssh_ca'),
+    'ssh_ca_revoke': dict(method='POST', path='/ssh/cas/{ssh_ca_id}/revoke', changed=True, key='ssh_ca',
+                          body={'reason': 'ssh_reason'}),
+    'ssh_krl_generate': dict(method='POST', path='/ssh/cas/{ssh_ca_id}/krl', changed=True, key='krl'),
+    'ssh_host_get': dict(method='GET', path='/ssh/hosts/{host_id}', key='ssh_host'),
+    'ssh_host_issue': dict(method='POST', path='/ssh/hosts/issue', changed=True, key='ssh_host_cert',
+                           required=['host_id'],
+                           body={'hostId': 'host_id', 'caId': 'host_ca_id',
+                                 'validForSeconds': 'host_valid_seconds', 'keyId': 'host_key_id'}),
+    'ssh_host_revoke': dict(method='POST', path='/ssh/hosts/{host_id}/revoke', changed=True, key='ssh_host',
+                            body={'reason': 'ssh_reason'}),
+    'ssh_host_offboard': dict(method='POST', path='/ssh/hosts/{host_id}/offboard', changed=True, key='ssh_host',
+                              body={'reason': 'ssh_reason'}),
+    'ssh_identity_disable': dict(method='POST', path='/ssh/identities/{identity_id}/disable', changed=True,
+                                 key='ssh_identity'),
+    'ssh_identity_offboard': dict(method='POST', path='/ssh/identities/{identity_id}/offboard', changed=True,
+                                  key='ssh_identity', body={'reason': 'ssh_reason'}),
+    'ssh_principal_revoke_grant': dict(method='POST', path='/ssh/principals/revoke-grant', changed=True,
+                                       key='result', required=['identity_id', 'principal_id'],
+                                       body={'identityId': 'identity_id', 'principalId': 'principal_id'}),
+    'ssh_principal_unmap': dict(method='POST', path='/ssh/principals/unmap', changed=True, key='result',
+                                required=['host_id', 'principal_id', 'local_account'],
+                                body={'hostId': 'host_id', 'principalId': 'principal_id',
+                                      'localAccount': 'local_account'}),
+    'ssh_principal_delete': dict(method='DELETE', path='/ssh/principals/{principal_id}', changed=True,
+                                 key='result'),
+    'ssh_token_revoke': dict(method='POST', path='/ssh/tokens/{token_id}/revoke', changed=True, key='ssh_token'),
+    'ssh_cert_revoke': dict(method='POST', path='/ssh/certs/{ssh_cert_id}/revoke', changed=True,
+                            key='ssh_certificate', body={'reason': 'ssh_reason'}),
+    'ssh_metrics': dict(method='GET', path='/ssh/metrics', key='ssh_metrics', zone_query=True),
+    'ssh_trust_anchors': dict(method='GET', path='/ssh/trust-anchors', key='trust_anchors', zone_query=True),
+    'ssh_bulk_expiring': dict(method='GET', path='/ssh/bulk/expiring', key='ssh_expiring',
+                              query={'withinSeconds': 'ssh_within_seconds'}),
+    'ssh_bulk_renew': dict(method='POST', path='/ssh/bulk/renew', changed=True, key='bulk',
+                           required=['ssh_cert_ids'], body={'certIds': 'ssh_cert_ids'}),
+    'ssh_bulk_revoke': dict(method='POST', path='/ssh/bulk/revoke', changed=True, key='bulk',
+                            required=['ssh_cert_ids'], body={'certIds': 'ssh_cert_ids', 'reason': 'ssh_reason'}),
+    'ssh_zone_archive': dict(method='POST', path='/ssh/zones/{zone}/archive', changed=True, key='ssh_zone'),
+    'ssh_zone_unarchive': dict(method='POST', path='/ssh/zones/{zone}/unarchive', changed=True, key='ssh_zone'),
+}
+
+
+def path_options(path):
+    return [part.split('}')[0] for part in path.split('{')[1:]]
+
+
+def run_simple_action(client, module, name):
+    spec = SIMPLE_ACTIONS[name]
+    params = module.params
+    path = spec['path'].format(**{k: quote(str(params[k]), safe='') for k in path_options(spec['path'])})
+    body = {api: params[opt] for api, opt in spec.get('body', {}).items() if params.get(opt) is not None}
+    query = {api: params[opt] for api, opt in spec.get('query', {}).items() if params.get(opt) is not None}
+    if spec.get('zone_query') and params.get('zone'):
+        query['zoneId'] = client.zone_id(params['zone'])
+    changed = spec.get('changed', False)
+    if changed and module.check_mode:
+        return {'changed': True, 'msg': f"{name} would run (check mode)"}
+    if spec.get('paged'):
+        r, items, total = client.get_all(path, params=query)
+        if r['error']:
+            return {'changed': False, 'failed': True, 'msg': r['error']}
+        return {'changed': False, spec['key']: items, 'total': total, 'msg': f"{name}: {total} items"}
+    data = body if (body or spec['method'] != 'GET') else None
+    r = client._request(spec['method'], path, data=data, params=query or None)
+    if r['error']:
+        return {'changed': False, 'failed': True, 'msg': r['error']}
+    result = {'changed': changed, spec['key']: r['data'], 'msg': f"{name}: done"}
+    if spec.get('bulk') and isinstance(r['data'], dict):
+        ok, bad = r['data'].get('successful', 0), r['data'].get('failed', 0)
+        result['msg'] = f"{name}: {ok} succeeded, {bad} failed"
+        result['changed'] = ok > 0
+        if bad:
+            errors = sorted({str(x.get('error')) for x in r['data'].get('results', []) if not x.get('success')})
+            result.update(failed=True, msg=f"{result['msg']}: {'; '.join(errors)[:500]} (see bulk.results)")
+    return result
+
+
 def run_module():
     """Run the Ansible module."""
     module_args = dict(
@@ -1550,7 +1894,9 @@ def run_module():
             'ssh_principals_pushed',
             # SSH zones
             'ssh_zone_list', 'ssh_zone_create',
-        ]),
+            # One-to-one API operations (SIMPLE_ACTIONS) and the other new actions
+            'ca_download', 'crl_download', 'report_generate', 'api_request',
+        ] + sorted(SIMPLE_ACTIONS)),
         api_url=dict(type='str', required=True),
         # OIDC is optional: omit for a backend with OIDC disabled
         # (ALLOW_UNAUTHENTICATED_SSH_CA=true) or for fleet-token host actions.
@@ -1650,6 +1996,33 @@ def run_module():
         idempotency_key=dict(type='str'),
         fleet_token=dict(type='str', no_log=True),
         zone=dict(type='str'),
+        cert_ids=dict(type='list', elements='str'),
+        ca_download_format=dict(type='str', default='pem', choices=[
+            'pem', 'crt', 'der', 'cer', 'p12-truststore', 'p12-keystore', 'jks-truststore', 'jks-keystore']),
+        crl_next_update_days=dict(type='int'),
+        crl_format=dict(type='str', default='crl', choices=['crl', 'der']),
+        audit_operation=dict(type='str'),
+        audit_entity_type=dict(type='str'),
+        audit_entity_id=dict(type='str'),
+        audit_status=dict(type='str', choices=['success', 'failure']),
+        audit_start=dict(type='str'),
+        audit_end=dict(type='str'),
+        audit_limit=dict(type='int', default=100),
+        report_type=dict(type='str', choices=['certificate_inventory', 'revocation', 'ca_operations']),
+        report_start=dict(type='int'),
+        report_end=dict(type='int'),
+        ssh_ca_id=dict(type='str'),
+        ssh_reason=dict(type='str'),
+        token_id=dict(type='str', no_log=False),
+        ssh_cert_id=dict(type='str'),
+        ssh_cert_ids=dict(type='list', elements='str'),
+        ssh_within_seconds=dict(type='int', default=2592000),
+        api_method=dict(type='str', default='GET', choices=['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
+        api_path=dict(type='str'),
+        api_body=dict(type='raw'),
+        api_query=dict(type='dict'),
+        api_public=dict(type='bool', default=False),
+        api_changed=dict(type='bool'),
         zone_display_name=dict(type='str'),
         zone_description=dict(type='str'),
         # Connection
@@ -1695,6 +2068,14 @@ def run_module():
             ('action', 'ssh_get_principals', ['host_fqdn', 'fleet_token']),
             ('action', 'ssh_principals_pushed', ['host_fqdn', 'fleet_token', 'principals_sha256']),
             ('action', 'ssh_zone_create', ['zone']),
+            ('action', 'ca_download', ['ca_id']),
+            ('action', 'crl_download', ['ca_id']),
+            ('action', 'report_generate', ['report_type']),
+            ('action', 'api_request', ['api_path']),
+        ] + [
+            ('action', name, sorted(set(path_options(spec['path']) + spec.get('required', []))))
+            for name, spec in sorted(SIMPLE_ACTIONS.items())
+            if path_options(spec['path']) or spec.get('required')
         ],
     )
 
@@ -2015,6 +2396,27 @@ def run_module():
             result = {'changed': True, 'msg': 'Principal push would be acknowledged (check mode)'}
         else:
             result = client.ssh_principals_pushed(module.params['host_fqdn'], module.params['principals_sha256'])
+
+    elif action in SIMPLE_ACTIONS:
+        result = run_simple_action(client, module, action)
+
+    elif action == 'ca_download':
+        result = client.ca_download(module.params['ca_id'], module.params['ca_download_format'],
+                                    module.params.get('download_password'), module.params.get('download_dest'))
+
+    elif action == 'crl_download':
+        result = client.crl_download(module.params['ca_id'], module.params['crl_format'],
+                                     module.params.get('download_dest'))
+
+    elif action == 'report_generate':
+        result = client.report_generate(module.params['report_type'], 'csv', module.params.get('ca_id'),
+                                        module.params.get('report_start'), module.params.get('report_end'),
+                                        module.params.get('download_dest'))
+
+    elif action == 'api_request':
+        result = client.api_request(module.params['api_method'], module.params['api_path'],
+                                    module.params.get('api_body'), module.params.get('api_query'),
+                                    module.params['api_public'], module.params.get('api_changed'))
 
     elif action == 'ssh_zone_list':
         result = client.ssh_zone_list()

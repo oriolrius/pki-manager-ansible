@@ -181,6 +181,20 @@ The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
 | `cert_download` | Download certificate in a format | `cert_id`, `download_format`, `download_password`, `download_dest` |
 | `cert_find` | Find the certificate with the serial of a PEM (needs Python `cryptography`) | `cert_pem` |
 
+### More X.509 actions
+
+| Action | Purpose | Key parameters |
+|---|---|---|
+| `ca_certs` | List the certificates of a CA (all pages) | `ca_id` |
+| `ca_download` | Download the CA certificate, truststore or keystore (idempotent with `download_dest`) | `ca_id`, `ca_download_format`, `download_password`, `download_dest` |
+| `crl_list` | List the CRLs of a CA | `ca_id` |
+| `crl_generate` | Generate a new CRL | `ca_id`, `crl_next_update_days` |
+| `crl_download` | Download the current CRL from the public distribution point (checks that it is a CRL) | `ca_id`, `crl_format` (`crl` PEM, `der`), `download_dest` |
+| `cert_bulk_renew` / `cert_bulk_revoke` / `cert_bulk_delete` | Renew, revoke or delete many certificates; fails when one item fails (see `bulk.results`) | `cert_ids` + the renew/revoke/delete options |
+| `domain_list` | Domain inventory | `search_query`, `ca_id` |
+| `audit_list` | Audit log entries | `audit_operation`, `audit_entity_type`, `audit_entity_id`, `audit_status`, `audit_start`, `audit_end`, `audit_limit` |
+| `report_generate` | Compliance report (CSV) | `report_type`, `ca_id`, `report_start`, `report_end`, `download_dest` |
+
 ### SSH actions
 
 | Action | Purpose | Key parameters |
@@ -208,6 +222,26 @@ The single `pki_manager` module exposes 36 actions — 16 X.509 + 20 SSH.
 | `ssh_register_host_pubkey` | Register ECIES host key (fleet-token) | `host_fqdn`, `fleet_token` |
 | `ssh_get_principals` | Fetch host `auth_principals` (fleet-token) | `host_fqdn`, `fleet_token` |
 | `ssh_principals_pushed` | Acknowledge the installed principal files so the host is not Stale (fleet-token; 409 `SHA256_MISMATCH` fails with `sha256_mismatch`/`current_sha256`; no-op in check mode) | `host_fqdn`, `fleet_token`, `principals_sha256` |
+
+### More SSH actions
+
+| Action | Purpose | Key parameters |
+|---|---|---|
+| `ssh_ca_get` / `ssh_ca_rotate` / `ssh_ca_retire` / `ssh_ca_revoke` / `ssh_krl_generate` | SSH CA lifecycle | `ssh_ca_id`, `ssh_reason` (revoke) |
+| `ssh_host_get` / `ssh_host_issue` / `ssh_host_revoke` / `ssh_host_offboard` | Host lifecycle (admin) | `host_id`, `host_ca_id`, `host_valid_seconds`, `host_key_id`, `ssh_reason` |
+| `ssh_identity_disable` / `ssh_identity_offboard` | Identity lifecycle | `identity_id`, `ssh_reason` |
+| `ssh_principal_revoke_grant` / `ssh_principal_unmap` / `ssh_principal_delete` | Undo a grant or a mapping; delete a principal | `identity_id`, `principal_id`, `host_id`, `local_account` |
+| `ssh_token_revoke` | Revoke a fleet token | `token_id` |
+| `ssh_cert_revoke` | Revoke an SSH certificate | `ssh_cert_id`, `ssh_reason` |
+| `ssh_bulk_expiring` / `ssh_bulk_renew` / `ssh_bulk_revoke` | Bulk SSH lifecycle | `ssh_within_seconds` (default 30 days), `ssh_cert_ids`, `ssh_reason` |
+| `ssh_metrics` / `ssh_trust_anchors` | Health metrics; trust anchors of a zone | `zone` |
+| `ssh_zone_archive` / `ssh_zone_unarchive` | Archive or reactivate a zone | `zone` |
+
+### Any other operation: `api_request`
+
+`api_request` calls any REST operation with the module's authentication, 429 retry and error handling: `api_method`, `api_path` (relative to `api_url`, or to the server root with `api_public: true` for the public routes such as `/cas/<id>.pem`), `api_body` (dict, list or JSON string), `api_query`. It returns `status` and `json` (or `text`/`content` for a public route). `changed` is `false` for GET and `true` for the other methods (override with `api_changed`); check mode sends only GET requests.
+
+The state-changing named actions report `changed: true` and do nothing in check mode. They are not idempotent on their own (the server can refuse a second `ssh_ca_retire`): guard them with `when:` in a playbook.
 
 X.509 and SSH-admin actions hit `{api_url}/…` with the optional OIDC Bearer. Host-facing actions (`ssh_sign_host`, `ssh_register_host_pubkey`, `ssh_get_principals`, `ssh_principals_pushed`) hit `/external/ssh` with the `fleet_token` Bearer. `required_if` enforces per-action mandatory parameters (e.g. `ssh_sign_host` requires `host_fqdn` + `host_pubkey` + `fleet_token`).
 
