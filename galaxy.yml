@@ -30,3 +30,7 @@ build_ignore:
   # Secrets for publishing (ANSIBLE_GALAXY_API_KEY) must never be packaged.
   - .env
   - ".env.*"
+  # Local tooling: the CodeGraph index and Python caches.
+  - .codegraph
+  - "**/__pycache__"
+  - "*.pyc"
