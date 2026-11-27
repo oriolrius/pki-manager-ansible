@@ -123,8 +123,11 @@ probe="it-probe-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
   as_backend "write pki-manager/keys/$probe/config deletion_allowed=true" &&
   as_backend "delete pki-manager/keys/$probe"; } ||
   fail "the backend token cannot create, sign with and delete a key on the Transit mount pki-manager"
-as_backend_out "write pki-manager/keys/$probe/import ciphertext=AAAA type=ecdsa-p256" | grep -q 'permission denied' ||
-  fail "the backend token can reach the key import path (import is migration-only)"
+if refusal=$(as_backend_out "write pki-manager/keys/$probe/import ciphertext=AAAA type=ecdsa-p256"); then
+  fail "the backend token can import a key (import is migration-only)"
+fi
+grep -Eq '^Code: 403([^0-9]|$)' <<<"$refusal" ||
+  fail "expected HTTP 403 when the backend token attempts a key import"
 if as_backend "read sys/mounts"; then
   fail "the backend token can read sys/mounts (not a scoped token)"
 fi
