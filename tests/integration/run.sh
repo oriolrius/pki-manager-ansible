@@ -131,6 +131,14 @@ grep -Eq '^Code: 403([^0-9]|$)' <<<"$refusal" ||
 if as_backend "read sys/mounts"; then
   fail "the backend token can read sys/mounts (not a scoped token)"
 fi
+# SCEP RA keys have their own credential (policy pki-manager-ra): the X.509/SSH token
+# cannot recover CMS session keys or sign with an RA key.
+for ra_op in "write pki-manager-ra/session-key/pkcs1v15/scep-ra-it ciphertext=AAAA key_version=1 session_key_length=32" \
+             "write pki-manager-ra/sign/scep-ra-it/sha2-256 input=aGVsbG8= prehashed=true"; do
+  if refusal=$(as_backend_out "$ra_op"); then fail "the backend token can call the SCEP RA mount ($ra_op)"; fi
+  grep -Eq '^Code: 403([^0-9]|$)' <<<"$refusal" ||
+    fail "expected HTTP 403 when the backend token calls the SCEP RA mount ($ra_op)"
+done
 
 echo "== PKI Manager $PKI_IMAGE on $PKI_BASE_URL"
 compose up -d --quiet-pull backend

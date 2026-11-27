@@ -26,8 +26,10 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   # One-shot, DEV/TEST ONLY: `run --rm openbao-bootstrap dev` initializes OpenBao with
-  # one unseal key, enables the Transit mounts, writes the policies and a scoped
-  # backend token (policies pki-manager-backend + pki-manager-ra, no default policy).
+  # one unseal key, enables the Transit mounts, writes the policies and two scoped tokens:
+  # backend-token (policy pki-manager-backend: X.509 and SSH keys) and ra-token (policy
+  # pki-manager-ra: SCEP RA keys only). The collection needs no SCEP, so the backend gets
+  # only backend-token (no OPENBAO_RA_TOKEN_FILE).
   openbao-bootstrap:
     image: ${OPENBAO_IMAGE:?run tests/integration/run.sh}
     profiles: [bootstrap]
