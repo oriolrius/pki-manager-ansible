@@ -110,13 +110,21 @@ bash "$PKI_OPENBAO_DIR/scripts/dev-tls.sh" "$PKI_IT_OPENBAO_STATE/tls" >/dev/nul
 compose up -d --quiet-pull openbao
 compose --profile bootstrap run --rm --quiet-pull openbao-bootstrap dev
 [[ -s "$PKI_IT_OPENBAO_STATE/secrets/backend-token" ]] || fail "the bootstrap wrote no backend token"
-# The backend token is scoped: it reads its Transit mount, and not the server
-# configuration.
-as_backend() {
+# The backend token is scoped: it creates, uses and deletes keys on its Transit mount.
+# It cannot import keys (only the migration token can) or read the server configuration.
+as_backend_out() {
   compose --profile bootstrap run --rm --entrypoint sh openbao-bootstrap -c \
-    "BAO_TOKEN=\"\$(cat /openbao/secrets/backend-token)\" bao $1" >/dev/null 2>&1
+    "BAO_TOKEN=\"\$(cat /openbao/secrets/backend-token)\" bao $1" 2>&1
 }
-as_backend "read pki-manager/wrapping_key" || fail "the backend token cannot use the Transit mount pki-manager"
+as_backend() { as_backend_out "$1" >/dev/null; }
+probe="it-probe-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+{ as_backend "write -f pki-manager/keys/$probe type=ecdsa-p256" &&
+  as_backend "write pki-manager/sign/$probe/sha2-256 input=aGVsbG8=" &&
+  as_backend "write pki-manager/keys/$probe/config deletion_allowed=true" &&
+  as_backend "delete pki-manager/keys/$probe"; } ||
+  fail "the backend token cannot create, sign with and delete a key on the Transit mount pki-manager"
+as_backend_out "write pki-manager/keys/$probe/import ciphertext=AAAA type=ecdsa-p256" | grep -q 'permission denied' ||
+  fail "the backend token can reach the key import path (import is migration-only)"
 if as_backend "read sys/mounts"; then
   fail "the backend token can read sys/mounts (not a scoped token)"
 fi
