@@ -2,7 +2,7 @@
 
 **`oriolrius.pki_manager`** — an Ansible collection for managing **both X.509 certificates and the SSH certificate workflow** through the PKI Manager REST API (one module plus two host-setup roles).
 
-- **Version:** 3.1.0 (tested against PKI Manager 3.19.0)
+- **Collection version:** 3.1.0. The integration suite tests PKI Manager 4.0.0 with OpenBao.
 - **Collection (FQCN):** `oriolrius.pki_manager`
 - **Requires:** ansible-core `>=2.15.0` (CI tests 2.17, 2.18, 2.19), `community.crypto >=2.0.0`
 - **Repository:** https://github.com/oriolrius/pki-manager-ansible
@@ -278,7 +278,7 @@ When `api_token` and `oidc_url`/`client_id`/`client_secret` are absent, the modu
 - **Downloads** — `download_format` (default `pem`): `pem`, `der`, `chain-pem`, `full-pem`, `full-der`, `key-pem`, `key-der`, `csr-pem`, `p12`, `pfx`, `pkcs8-pem`, `pkcs8-der`, `pkcs8-encrypted`, `jks-keystore`, `jks-truststore`. `download_password` is required for `p12`/`pfx`/`jks-keystore`/`jks-truststore`/`pkcs8-encrypted`. The password goes in the `X-Export-Password` header, never in the URL. `download_dest` is written `chmod 0600`; if omitted, content is returned base64-encoded. `chain-pem` is certificate + issuing CA and `full-pem` is certificate + **private key** + issuing CA (PKI Manager 3.19.1+; before, `chain-pem` had no CA and `full-pem` had no chain). Never write `full-pem` to a file that others can read. `download_dest` is idempotent: the same content with mode 0600 gives `changed: false`, and check mode reports the change without writing.
 - **Renewal** — `cert_renew` takes `cert_validity`, `renew_new_key` (`false` keeps the key), `revoke_original`, and new subject/SAN values (`cert_cn`, `cert_org`, `cert_country`, `cert_ou`, `cert_state`, `cert_locality`, `cert_dns_names`, `cert_ip_addresses`, `cert_emails`). Any of these sets `updateInfo`; PKI Manager 3.19.1+ keeps the subject fields you do not give (3.19.0 drops them: give CN, O and C together).
 - **Delete** — `destroy_key` (`ca_delete`, `cert_delete`; the server keeps a key another certificate uses) and `remove_from_crl` (`cert_delete`).
-- **Tags** — `tags` for `ca_create` and `cert_issue` (stored on the KMS objects).
+- **Tags** — `tags` for `ca_create` and `cert_issue` (PKI Manager 4 stores these tags in SQLite).
 - **Revocation** — `revocation_details` (free text), `revocation_effective_date` (Unix time) and `generate_crl` (`cert_revoke`), and `revocation_reason` (shared by `ca_revoke` and `cert_revoke`): `unspecified` (default), `keyCompromise`, `caCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`.
 - **Lists** — `ca_list` and `cert_list` read every page, so `cas`/`certificates` hold all items (not only the first 50).
 - **Search / dashboards** — `search_query` (required for `search`), `search_limit` (default `10`), `expiring_limit` (default `5`, capped at `20`).
