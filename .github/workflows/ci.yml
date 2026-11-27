@@ -1,6 +1,7 @@
 ---
 # Lint, sanity and integration tests of the oriolrius.pki_manager collection.
-# The integration job runs a throwaway PKI Manager (tests/integration/run.sh):
+# The integration job runs a throwaway PKI Manager with OpenBao and no Cosmian KMS
+# (tests/integration/run.sh):
 # the module against the real API, then both roles twice on an Ubuntu container
 # (the second run must change nothing).
 name: CI
@@ -67,7 +68,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pki: ["3.19.0", "3.19.1"]
+        # PKI Manager 4+ (OpenBao). 3.x needs Cosmian KMS: collection 3.1.0 tested it.
+        pki: ["4.0.0"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:

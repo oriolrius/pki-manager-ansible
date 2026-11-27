@@ -1,32 +1,76 @@
 ---
 # A throwaway PKI Manager for the integration tests (tests/integration/run.sh).
+# Keys live in OpenBao Transit (the PKI Manager fork); there is no Cosmian KMS.
 # OIDC is off and the SSH CA accepts unauthenticated admin calls: test data only.
+#
+# run.sh sets every variable below. The OpenBao config, policies and bootstrap
+# script come from the pki-manager-web release under test (its openbao/ folder,
+# PKI_OPENBAO_DIR), so this stack and the backend always use the same contract.
+# OpenBao keeps its Raft data and audit log in tmpfs: nothing outlives the run.
 name: pki-ansible-it
 
 services:
-  kms:
-    image: ghcr.io/cosmian/kms:${KMS_IMAGE_TAG:-5.28.0}
-    environment:
-      - COSMIAN_KMS_CONF=/etc/cosmian/kms.toml
+  openbao:
+    image: ${OPENBAO_IMAGE:?run tests/integration/run.sh}
+    user: "${PKI_IT_UID:?}:${PKI_IT_GID:?}"
     volumes:
-      - ./kms.toml:/etc/cosmian/kms.toml:ro
+      - ${PKI_OPENBAO_DIR:?}/config:/openbao/config:ro
+      - ${PKI_IT_OPENBAO_STATE:?}/tls:/openbao/tls:ro
     tmpfs:
-      - /cosmian-kms/sqlite-data
-      - /tmp
+      - /openbao/data:uid=${PKI_IT_UID},gid=${PKI_IT_GID},mode=0700
+      - /openbao/logs:uid=${PKI_IT_UID},gid=${PKI_IT_GID},mode=0700
+    environment:
+      BAO_API_ADDR: https://openbao:8200
+      BAO_CLUSTER_ADDR: https://openbao:8201
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # One-shot, DEV/TEST ONLY: `run --rm openbao-bootstrap dev` initializes OpenBao with
+  # one unseal key, enables the Transit mounts, writes the policies and two scoped tokens:
+  # backend-token (policy pki-manager-backend: X.509 and SSH keys) and ra-token (policy
+  # pki-manager-ra: SCEP RA keys only). The collection needs no SCEP, so the backend gets
+  # only backend-token (no OPENBAO_RA_TOKEN_FILE).
+  openbao-bootstrap:
+    image: ${OPENBAO_IMAGE:?run tests/integration/run.sh}
+    profiles: [bootstrap]
+    user: "${PKI_IT_UID:?}:${PKI_IT_GID:?}"
+    entrypoint: ["/bin/sh", "/openbao/scripts/bootstrap.sh"]
+    environment:
+      BAO_ADDR: https://openbao:8200
+      BAO_CACERT: /openbao/tls/ca.pem
+      PKI_MANAGER_OPENBAO_DEV: "1"
+    volumes:
+      - ${PKI_OPENBAO_DIR:?}/scripts:/openbao/scripts:ro
+      - ${PKI_OPENBAO_DIR:?}/policies:/openbao/policies:ro
+      - ${PKI_IT_OPENBAO_STATE:?}/tls:/openbao/tls:ro
+      - ${PKI_IT_OPENBAO_STATE:?}/secrets:/openbao/secrets
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
 
   backend:
-    image: ghcr.io/oriolrius/pki-manager-web/backend:${PKI_IMAGE_TAG:-3.19.0}
+    image: ${PKI_IMAGE:?run tests/integration/run.sh}
     depends_on:
-      - kms
+      - openbao
+    # The host user, so the backend can read the 0600 token file that the bootstrap
+    # wrote. The backend sees only that token and the CA certificate: never the
+    # unseal key or the root token.
+    user: "${PKI_IT_UID:?}:${PKI_IT_GID:?}"
     environment:
       - NODE_ENV=production
       - PORT=3000
       - HOST=0.0.0.0
       - DATABASE_PATH=/app/backend/data/pki.db
-      - KMS_URL=http://kms:9998
+      - OPENBAO_ADDR=https://openbao:8200
+      - OPENBAO_CACERT=/run/openbao/ca.pem
+      - OPENBAO_TOKEN_FILE=/run/openbao/token
+      - OPENBAO_TRANSIT_MOUNT=pki-manager
+      - OPENBAO_RA_MOUNT=pki-manager-ra
       - CRL_DISTRIBUTION_URL=http://localhost:${PKI_PORT:-3000}/crl
       - ALLOW_UNAUTHENTICATED_SSH_CA=true
       - ALLOW_CA_KEY_EXPORT=false
+    volumes:
+      - ${PKI_IT_OPENBAO_STATE:?}/tls/ca.pem:/run/openbao/ca.pem:ro
+      - ${PKI_IT_OPENBAO_STATE:?}/secrets/backend-token:/run/openbao/token:ro
     ports:
       - "127.0.0.1:${PKI_PORT:-3000}:3000"
     tmpfs:

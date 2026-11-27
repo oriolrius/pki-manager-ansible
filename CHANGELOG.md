@@ -3,6 +3,12 @@
 All notable changes to the `oriolrius.pki_manager` collection. Versions follow
 semantic versioning. Each version has a GitHub release with the full notes.
 
+## Unreleased
+
+### Changed
+
+- Integration tests run PKI Manager 4 with OpenBao (the PKI Manager fork) and no Cosmian KMS. The OpenBao config, policies, bootstrap and pinned image come from the `openbao/` folder of the PKI Manager release under test. The backend gets a scoped token, and the run checks its scope and that the keys are in OpenBao Transit. PKI Manager 3.x (Cosmian) is no longer in the test matrix. The module and the roles do not change.
+
 ## 3.1.0 (2026-11-26)
 
 ### Added
